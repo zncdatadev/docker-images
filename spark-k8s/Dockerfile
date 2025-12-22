@@ -106,7 +106,7 @@ RUN SPARK_HOME=/kubedoop/spark /kubedoop/spark/bin/spark-shell --version
 
 COPY --from=hadoop \
     /kubedoop/hadoop/share/hadoop/tools/lib/hadoop-aws-*.jar \
-    /kubedoop/hadoop/share/hadoop/tools/lib/aws-java-sdk-bundle-*.jar \
+    /kubedoop/hadoop/share/hadoop/tools/lib/bundle-*.jar \
     /kubedoop/spark/jars/
 
 COPY --from=hadoop \
