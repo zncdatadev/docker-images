@@ -92,11 +92,6 @@ RUN <<EOF
     ln -s /kubedoop/spark/jars/spark-examples_*.jar /kubedoop/spark/examples.jar
     popd
 
-
-
-    # cleanup source
-    rm -rf /build/spark-src
-
     # cleanup cache
     rm -rf /root/.m2
 EOF
@@ -125,6 +120,20 @@ COPY --from=hadoop \
 #     /kubedoop/hbase/lib/client-facing-thirdparty/opentelemetry-context-*.jar \
 #     /kubedoop/hbase/lib/client-facing-thirdparty/opentelemetry-semconv-*.jar \
 #     /kubedoop/spark/jars/
+
+# Fix the issue where log4j-slf4j-impl is missing when adding external JARs on top of the Spark base,
+# which causes logging output to fail
+RUN <<EOF
+    # Download log4j-slf4j-impl-x.x.x.jar containing the StaticLoggerBinder
+    # which is required by the connector.
+    # Spark contains only log4j-slf4j2-impl-x.x.x.jar but excludes
+    # log4j-slf4j-impl-x.x.x.jar. It is okay to have both JARs in the
+    # classpath as long as they have the same version.
+    mvn --quiet --non-recursive --no-transfer-progress --batch-mode --file /build/spark-src/pom.xml \
+        dependency:copy \
+        -Dartifact=org.apache.logging.log4j:log4j-slf4j-impl:'${log4j.version}' \
+        -DoutputDirectory=/kubedoop/spark/jars
+EOF
 
 # download extra-jars
 COPY --from=gradle-builder /jars /kubedoop/spark/extra-jars
