@@ -92,9 +92,6 @@ RUN <<EOF
     ln -s /kubedoop/spark/jars/spark-examples_*.jar /kubedoop/spark/examples.jar
     popd
 
-    # cleanup source
-    rm -rf /build/spark-src
-
     # cleanup cache
     rm -rf /root/.m2
 EOF
