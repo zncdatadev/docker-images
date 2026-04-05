@@ -24,7 +24,7 @@ See `versions.yaml` for current values. Structure:
 
 ## Kubedoop Customizations
 ### Patches
-None -- only product that builds purely from upstream source without any patches.
+None -- only product that builds purely from upstream source without any kubedoop source patches (post-build Log4Shell JAR hardening is applied separately).
 
 ### JMX Configuration (1 config)
 - `config.yaml` -- most detailed JMX config in the repo (~70 lines): per-second counters, gauges, histogram percentile emulation, quota metrics, coordinator metrics. Extensive Kafka-specific rules.

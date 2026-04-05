@@ -21,7 +21,7 @@ See `versions.yaml` for current values. Structure:
 
 ## Kubedoop Customizations
 ### Patches (1)
-- `patches/3.9.2/` — 1 patch: cyclonedx-plugin (note: patch dir is 3.9.2 but current product version is 3.9.3)
+- `kubedoop/patches/3.9.2/` — 1 patch: cyclonedx-plugin (note: patch dir is 3.9.2 but current product version is 3.9.3)
 ### JMX Configuration
 - `kubedoop/jmx/config/config.yaml` — ZooKeeper-specific rules: ReplicatedServer patterns (with replicaId label), standalone patterns, InMemoryDataTree pattern (with memberType label)
 ### Custom Scripts

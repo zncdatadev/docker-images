@@ -23,8 +23,8 @@ See `versions.yaml` for current values. Structure:
 
 ## Kubedoop Customizations
 ### Patches (12 total)
-- `3.1.3/` -- 10 patches: HIVE-26905, HIVE-21939, HIVE-26522, HIVE-26743, HIVE-26882, HIVE-27508, patch-updates, logging-deps, maven-warning, postgres-driver
-- `4.0.1/` -- 2 patches: postgres-driver, logging-dependencies
+- `kubedoop/patches/3.1.3/` -- 10 patches: HIVE-26905, HIVE-21939, HIVE-26522, HIVE-26743, HIVE-26882, HIVE-27508, patch-updates, logging-deps, maven-warning, postgres-driver
+- `kubedoop/patches/4.0.1/` -- 2 patches: postgres-driver, logging-dependencies
 
 ### JMX Configuration (1 config)
 - `config.yaml` -- minimal JMX configuration

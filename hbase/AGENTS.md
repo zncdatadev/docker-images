@@ -29,9 +29,9 @@ See `versions.yaml` for current values. Structure:
 
 ## Kubedoop Customizations
 ### Patches (13 total across 3 components)
-- `hbase/2.4.18/` -- 5 patches (HBASE-27103, HBASE-28242, HBASE-28379, HBASE-28511, patch-updates) + series file
-- `hbase/2.6.1/` -- 4 patches (async-profiler support, dependency updates, jackson-dataformat-xml, CycloneDX) + patchable.toml
-- `hbase-operator-tools/1.3.0-fd5a5fb/` -- 2 patches (exclude hbase-testing-utils, configure git-commit-id-plugin)
+- `kubedoop/patches/hbase/2.4.18/` -- 5 patches (HBASE-27103, HBASE-28242, HBASE-28379, HBASE-28511, patch-updates) + series file
+- `kubedoop/patches/hbase/2.6.1/` -- 4 patches (async-profiler support, dependency updates, jackson-dataformat-xml, CycloneDX) + patchable.toml
+- `kubedoop/patches/hbase-operator-tools/1.3.0-fd5a5fb/` -- 2 patches (exclude hbase-testing-utils, configure git-commit-id-plugin)
 
 ### JMX Configuration (4 configs)
 - `master.yaml` -- HBase Master metrics (uses catch-all pattern `.*`)

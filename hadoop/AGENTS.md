@@ -25,8 +25,8 @@ See `versions.yaml` for current values. Structure:
 
 ## Kubedoop Customizations
 ### Patches (18 total)
-- `3.3.6/` -- 8 patches: YARN-11527, datanode registration override, HADOOP-18055, HADOOP-18077, perf event itimer, HDFS-17378, snappy CVEs, HADOOP-18516
-- `3.4.1/` -- 10 patches: YARN-11527/node.js, datanode registration, async-profiler itimer, HDFS-17378, CycloneDX, OSS connector, netty CVEs x2, kafka CVE, Jetty upgrade
+- `kubedoop/patches/3.3.6/` -- 8 patches: YARN-11527, datanode registration override, HADOOP-18055, HADOOP-18077, perf event itimer, HDFS-17378, snappy CVEs, HADOOP-18516
+- `kubedoop/patches/3.4.1/` -- 10 patches: YARN-11527/node.js, datanode registration, async-profiler itimer, HDFS-17378, CycloneDX, OSS connector, netty CVEs x2, kafka CVE, Jetty upgrade
 
 ### JMX Configuration (3 configs)
 - `namenode.yaml` -- HDFS NameNode-specific whitelist/blacklist patterns

@@ -20,7 +20,7 @@ See `versions.yaml` for current values. Structure:
 
 ## Kubedoop Customizations
 ### Patches (3)
-- `patches/2.4.0/` — 3 patches: no-zip-assembly, add-cyclonedx-plugin, disable-host-port-validation
+- `kubedoop/patches/2.4.0/` — 3 patches: no-zip-assembly, add-cyclonedx-plugin, disable-host-port-validation
 ### JMX Configuration
 - NONE — only Tier 1 product without JMX exporter
 ### Custom Scripts
