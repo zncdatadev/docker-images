@@ -1,9 +1,9 @@
 versions:
-  - product: 1.25.5
+  - product: 1.26.0
     kubedoop-base: 1.0.0
-  - product: 1.25.3
+  - product: 1.25.8
     kubedoop-base: 1.0.0
-  - product: 1.24.11
+  - product: 1.24.13
     kubedoop-base: 1.0.0
-  - product: 1.24.9
+  - product: 1.23.12
     kubedoop-base: 1.0.0
