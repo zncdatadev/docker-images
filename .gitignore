@@ -310,6 +310,8 @@ fabric.properties
 
 .vscode
 
+# ai coding
+.omc
 
 # Local History for Visual Studio Code
 .history/
