@@ -80,15 +80,16 @@ Kubernetes sends SIGTERM
 |  |  [4] trap SIGTERM -> cleanup         Register handler   | |
 |  |  [5] "$@" &                          Start main process | |
 |  |  [6] write_pid $MAIN_PID            Publish PID         | |
-|  |  [7] wait $MAIN_PID                  Wait               | |
+|  |  [7] write_state running            Signal to sidecars  | |
+|  |  [8] wait $MAIN_PID                  Wait               | |
 |  |                                                         | |
 |  |  -- On SIGTERM received --                              | |
-|  |  [8] write_state stopping           Signal to sidecars  | |
-|  |  [9] kill -TERM $MAIN_PID            Forward signal     | |
-|  |  [10] wait $MAIN_PID                 Wait for exit      | |
-|  |  [11] write_state stopped            Signal to sidecars | |
-|  |  [12] run_phase mount/post-script    Runtime post-hooks | |
-|  |  [13] exit $EXIT_CODE                Propagate exit     | |
+|  |  [9] write_state stopping           Signal to sidecars  | |
+|  |  [10] kill -TERM $MAIN_PID            Forward signal     | |
+|  |  [11] wait $MAIN_PID                 Wait for exit      | |
+|  |  [12] write_state stopped            Signal to sidecars | |
+|  |  [13] run_phase mount/post-script    Runtime post-hooks | |
+|  |  [14] exit $EXIT_CODE                Propagate exit     | |
 |  +---------------------------------------------------------+ |
 +--------------------------------------------------------------+
 ```
@@ -135,8 +136,8 @@ discover_scripts() {
         return 0
     fi
 
-    # Only match .sh suffix + executable permission + regular file
-    find "$phase_dir" -maxdepth 1 -type f -name '*.sh' -perm -u+x \
+    # Only match .sh files that are executable by the current container user
+    find "$phase_dir" -maxdepth 1 -type f -name '*.sh' -executable \
         | sort
 }
 
@@ -192,6 +193,7 @@ run_phase() {
 # All writes use atomic rename (write-to-tmp + mv) to prevent
 # sidecars from reading partial content.
 
+KUBEDOOP_HOME="${KUBEDOOP_HOME:-/kubedoop}"
 KUBEDOOP_RUN_DIR="${KUBEDOOP_RUN_DIR:-${KUBEDOOP_HOME}/run}"
 
 # Atomic write: write to tmp file, then rename
@@ -309,7 +311,7 @@ cleanup() {
     fi
     _CLEANUP_RUNNING=1
 
-    log_info "Received shutdown signal"
+    log_info "Starting shutdown cleanup"
 
     # Notify sidecars: main container is stopping
     write_state "stopping"
@@ -351,11 +353,10 @@ if [[ $# -eq 0 ]]; then
     exit 1
 fi
 
-write_state "running"
-
 "$@" &
 MAIN_PID=$!
 write_pid "$MAIN_PID"
+write_state "running"
 log_info "Main process started (PID: $MAIN_PID): $*"
 
 # Wait for main process to exit
@@ -376,6 +377,8 @@ exit $EXIT_CODE
 # Install init system (e.g., tini, dumb-init — to be decided)
 RUN <<EOF
     microdnf install tini
+    microdnf clean all
+    rm -rf /var/cache/yum
 EOF
 
 # Deploy universal entrypoint framework
@@ -477,7 +480,7 @@ spec:
 Key points:
 
 - `/kubedoop/mount/pre-script/` and `/kubedoop/mount/post-script/` are **fixed mount points**
-- The entrypoint framework auto-discovers all `*.sh` files with execute permission
+- The entrypoint framework auto-discovers all `*.sh` files that are executable by the container user
 - Scripts are sorted by filename and executed sequentially
 - No volume mount = no scripts discovered = zero-intrusion
 
@@ -489,13 +492,13 @@ Key points:
 
 ### Important: ConfigMap Permission Contract
 
-Scripts are discovered only if they have the **owner-execute bit** set (`-perm -u+x`). When using ConfigMap volumes:
+Scripts are discovered only if they are **executable by the user running inside the container** (using `find -executable`). When using ConfigMap volumes:
 
-- Always set `defaultMode: 0755` on the ConfigMap volume source
+- Always set `defaultMode: 0755` on the ConfigMap volume source so mounted scripts are executable for the runtime user
 - When using `items:` with per-item `mode:`, ensure each script item has mode `0755`
-- Projected volumes and downward API volumes follow the same rule
+- Projected volumes and downward API volumes must follow the same executability requirement
 
-If scripts are found in the directory but none have execute permission, the framework logs an info message and proceeds as if no scripts were found.
+If scripts are found in the directory but none are executable by the runtime user, the framework logs an info message and proceeds as if no scripts were found.
 
 ## Script Naming Convention
 
@@ -614,8 +617,17 @@ wait_for_state "running" "${KUBEDOOP_STARTUP_TIMEOUT:-120}" || {
 }
 log_info "Main container is running"
 
-# Start sidecar main process (e.g., vector)
-vector --config /etc/vector/vector.toml &
+# Start sidecar main process
+# The sidecar command must be provided via KUBEDOOP_SIDECAR_CMD env var or as script arguments.
+# Example: KUBEDOOP_SIDECAR_CMD="vector --config /etc/vector/vector.toml"
+if [[ $# -gt 0 ]]; then
+    "$@" &
+elif [[ -n "${KUBEDOOP_SIDECAR_CMD:-}" ]]; then
+    eval "$KUBEDOOP_SIDECAR_CMD" &
+else
+    log_error "No sidecar command specified. Use KUBEDOOP_SIDECAR_CMD or pass command as arguments."
+    exit 1
+fi
 SIDECAR_PID=$!
 log_info "Sidecar process started (PID: $SIDECAR_PID)"
 
@@ -674,6 +686,8 @@ spec:
           env:
             - name: KUBEDOOP_SIDECAR_MODE
               value: "native"      # Watchdog triggers flush only, waits for K8s SIGTERM
+            - name: KUBEDOOP_SIDECAR_CMD
+              value: "vector --config /etc/vector/vector.toml"
           command: ["/kubedoop/bin/sidecar-watchdog.sh"]
           volumeMounts:
             - name: pod-state
@@ -687,6 +701,8 @@ spec:
       #     env:
       #       - name: KUBEDOOP_SIDECAR_MODE
       #         value: "legacy"    # Watchdog controls exit after detecting main stopped
+      #       - name: KUBEDOOP_SIDECAR_CMD
+      #         value: "vector --config /etc/vector/vector.toml"
       #     command: ["/kubedoop/bin/sidecar-watchdog.sh"]
       #     volumeMounts:
       #       - name: pod-state
