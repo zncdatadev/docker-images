@@ -529,9 +529,37 @@ Pod
     └── Unaware of main container exit → keeps running → Pod stuck
 ```
 
+### Core Principle
+
+> **State files coordinate behavior (flush/drain), not exit decisions.**
+> Exit decisions belong to Kubernetes (native mode) or the watchdog (legacy mode).
+
+### Native Sidecar Restart Problem (K8s 1.28+)
+
+K8s 1.28+ native sidecars (`restartPolicy: Always` in initContainers) restart when they exit while regular containers are still running. If the sidecar watchdog exits based on state files, it triggers an unwanted restart loop:
+
+```
+[1] Main container: write "stopping" → starts graceful shutdown (still running)
+[2] Sidecar watchdog: sees "stopping" → exits
+[3] K8s: sidecar exited, main container still running → restartPolicy: Always → RESTART sidecar!
+[4] Sidecar restarts → watchdog starts → wait_for_state "running" → sees "stopping"
+[5] Watchdog fails → sidecar exits → restart loop!
+```
+
+**Solution**: In native mode, the sidecar must NOT exit on its own. It waits for K8s to send SIGTERM. State files only trigger early flush/drain behavior.
+
+### Dual-Mode Design
+
+| Aspect | Native Mode (K8s >= 1.28) | Legacy Mode (K8s < 1.28) |
+|--------|---------------------------|---------------------------|
+| Who decides when sidecar exits | K8s (SIGTERM during Pod termination) | Watchdog (detects main container stopped) |
+| State file purpose | Trigger flush/drain, NOT control exit | Control exit + trigger flush |
+| Sidecar exit behavior | Waits for SIGTERM, never exits voluntarily | Exits after detecting "stopped" |
+| Restart risk | None (K8s manages) | N/A (no restart policy) |
+
 ### Solution: Shared emptyDir + File-Based Coordination
 
-The entrypoint framework writes state files to `/kubedoop/run/` (shared via emptyDir volume). Sidecar containers monitor these files using **inotifywait** (already installed in the vector image) to synchronize their lifecycle.
+The entrypoint framework writes state files to `/kubedoop/run/` (shared via emptyDir volume). Sidecar containers monitor these files using **inotifywait** (already installed in the vector image) to coordinate behavior.
 
 All state file writes use **atomic rename** (write-to-tmp + mv) to prevent sidecars from reading partial content.
 
@@ -539,13 +567,13 @@ All state file writes use **atomic rename** (write-to-tmp + mv) to prevent sidec
 emptyDir volume mounted at /kubedoop/run/ (shared between all containers)
 
 Main Container:                    Sidecar Container (vector):
-  write "running"  ──────────────────> inotifywait detects file
-  write PID                          │ watches directory for main.status
-  ...main process runs...            │
-  write "stopping" ──────────────────> inotifywait detects change
-  SIGTERM → main process             │ vector begins graceful flush
-  write "stopped"  ──────────────────> vector flushes buffers
-  exit                               │ vector exits
+  write "running"  ──────────────────> watchdog detects, starts vector
+  write PID                          │
+  ...main process runs...            │ vector running normally
+  write "stopping" ──────────────────> watchdog detects
+  SIGTERM → main process             │ triggers early flush (SIGUSR1)
+  write "stopped"  ──────────────────> (native: K8s sends SIGTERM to sidecar)
+  exit                               │ (legacy: watchdog exits voluntarily)
                                      v
                                    Pod terminates
 ```
@@ -562,17 +590,21 @@ Main Container:                    Sidecar Container (vector):
 
 ### Sidecar Watchdog Script
 
-Vector sidecar uses this pattern to synchronize with the main container:
-
 ```bash
 #!/bin/bash
 # /kubedoop/bin/sidecar-watchdog.sh — Sidecar lifecycle coordination
+#
+# Dual-mode design:
+#   native (K8s >= 1.28): State files trigger flush only. K8s manages exit.
+#   legacy (K8s < 1.28):  State files trigger flush AND control exit.
 set -uo pipefail
+
+KUBEDOOP_SIDECAR_MODE="${KUBEDOOP_SIDECAR_MODE:-native}"
 
 source /kubedoop/lib/log.sh
 source /kubedoop/lib/pod-state.sh
 
-log_info "Sidecar watchdog starting"
+log_info "Sidecar watchdog starting (mode: ${KUBEDOOP_SIDECAR_MODE})"
 
 # Wait for main container to be ready
 # Also exits early if main.exit_code appears (main container crashed during startup)
@@ -582,22 +614,46 @@ wait_for_state "running" "${KUBEDOOP_STARTUP_TIMEOUT:-120}" || {
 }
 log_info "Main container is running"
 
-# Wait for main container to begin shutdown
-wait_for_state "stopping" "${KUBEDOOP_RUN_TIMEOUT:-86400}" || {
-    log_error "Timeout waiting for main container to stop"
-    exit 1
-}
-log_info "Main container is stopping, sidecar shutting down"
+# Start sidecar main process (e.g., vector)
+vector --config /etc/vector/vector.toml &
+SIDECAR_PID=$!
+log_info "Sidecar process started (PID: $SIDECAR_PID)"
 
-# Wait for main container to fully stop
-wait_for_state "stopped" "${KUBEDOOP_SHUTDOWN_TIMEOUT:-30}" || true
-log_info "Main container stopped"
+# Background monitor: watches state files to trigger early flush
+# This does NOT exit the sidecar — only sends a flush signal
+(
+    if wait_for_state "stopping" "${KUBEDOOP_RUN_TIMEOUT:-86400}"; then
+        log_info "Main container stopping, triggering sidecar flush"
+        # Send flush signal to sidecar process (e.g., SIGUSR1 for vector)
+        kill -USR1 "$SIDECAR_PID" 2>/dev/null || true
+    fi
+) &
+MONITOR_PID=$!
 
-# Graceful flush/drain logic here (vector will handle its own shutdown via SIGTERM)
-# When this script exits, the sidecar container's PID 1 process
-# (which wraps this script) will also exit
-
-log_info "Sidecar watchdog exiting"
+# Mode-specific exit strategy
+case "${KUBEDOOP_SIDECAR_MODE}" in
+    native)
+        # K8s 1.28+: Do NOT exit voluntarily.
+        # Wait for sidecar process to finish (it will be terminated by K8s SIGTERM).
+        # K8s sends SIGTERM to sidecar after all regular containers exit.
+        # The sidecar process (vector) handles SIGTERM with its own graceful shutdown.
+        wait "$SIDECAR_PID" || true
+        log_info "Sidecar process exited"
+        ;;
+    legacy)
+        # Pre-1.28: Wait for main container to fully stop, then exit voluntarily.
+        # Without this, the sidecar would keep running and the Pod would never terminate.
+        wait_for_state "stopped" "${KUBEDOOP_SHUTDOWN_TIMEOUT:-30}" || true
+        log_info "Main container stopped, terminating sidecar"
+        kill -TERM "$SIDECAR_PID" 2>/dev/null || true
+        wait "$SIDECAR_PID" 2>/dev/null || true
+        log_info "Sidecar process terminated"
+        ;;
+    *)
+        log_error "Unknown KUBEDOOP_SIDECAR_MODE: ${KUBEDOOP_SIDECAR_MODE} (expected: native|legacy)"
+        exit 1
+        ;;
+esac
 ```
 
 ### Kubernetes Pod Spec
@@ -610,19 +666,27 @@ spec:
     spec:
 
       # Option A: Kubernetes 1.28+ native sidecar (recommended)
+      # Sidecar must NOT exit on its own — K8s manages its lifecycle.
       initContainers:
         - name: vector
-          restartPolicy: Always    # K8s manages lifecycle automatically
+          restartPolicy: Always    # K8s restarts sidecar if it crashes during normal operation
           image: zncdatadev/vector:0.47.0
+          env:
+            - name: KUBEDOOP_SIDECAR_MODE
+              value: "native"      # Watchdog triggers flush only, waits for K8s SIGTERM
           command: ["/kubedoop/bin/sidecar-watchdog.sh"]
           volumeMounts:
             - name: pod-state
               mountPath: /kubedoop/run
 
       # Option B: Pre-1.28 sidecar (manual coordination)
+      # Watchdog must exit voluntarily after main container stops.
       # containers:
       #   - name: vector
       #     image: zncdatadev/vector:0.47.0
+      #     env:
+      #       - name: KUBEDOOP_SIDECAR_MODE
+      #         value: "legacy"    # Watchdog controls exit after detecting main stopped
       #     command: ["/kubedoop/bin/sidecar-watchdog.sh"]
       #     volumeMounts:
       #       - name: pod-state
@@ -647,12 +711,12 @@ spec:
 
 ### Strategy per Kubernetes Version
 
-| K8s Version | Strategy | Coordination Mechanism |
-|-------------|----------|----------------------|
-| >= 1.28 | Native sidecar (`restartPolicy: Always` in initContainers) | K8s manages lifecycle automatically; state files provide additional visibility |
-| < 1.28 | Standard container + watchdog | State files + inotifywait for full coordination |
+| K8s Version | Sidecar Type | Exit Decision | State File Role |
+|-------------|-------------|---------------|-----------------|
+| >= 1.28 | `initContainer` + `restartPolicy: Always` | K8s sends SIGTERM to sidecar after regular containers exit | Trigger early flush only |
+| < 1.28 | Standard `container` | Watchdog detects `stopped` and exits voluntarily | Trigger flush AND control exit |
 
-For K8s >= 1.28, the native sidecar handles start/stop ordering, but the state files still provide useful visibility (PID, exit code) for debugging and advanced coordination scenarios.
+For K8s >= 1.28, the native sidecar handles start/stop ordering. State files provide early flush triggering (the sidecar starts draining before K8s even sends SIGTERM), which reduces log loss during shutdown. State files also provide visibility (PID, exit code) for debugging.
 
 ## Gradual Migration Path
 
