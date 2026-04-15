@@ -351,6 +351,10 @@ if [[ $# -eq 0 ]]; then
     exit 1
 fi
 
+# Clean stale/fake state files left by previous runs or injected scripts.
+# This ensures sidecars only see state written by this entrypoint instance.
+rm -f "${KUBEDOOP_RUN_DIR}"/main.{pid,status,exit_code}
+
 "$@" &
 MAIN_PID=$!
 write_pid "$MAIN_PID"
@@ -847,6 +851,16 @@ With `readOnlyRootFilesystem: true`:
 | K8s security | `runAsNonRoot: true`, `runAsUser: 1001` | Container never runs as root |
 | K8s security | `allowPrivilegeEscalation: false` | Scripts cannot gain root via setuid |
 | Pod spec | Only `/kubedoop/run/` as emptyDir | Write surface limited to state files |
+
+### Trust Boundary
+
+The security model protects the **container image** (framework + application), not mounted volumes. The operator controls both injected scripts (ConfigMap content) and writable mount paths (Pod spec volumes). If the operator is malicious, they have more direct attack vectors (privileged containers, host mounts, etc.).
+
+**What is protected**: Injected scripts cannot modify framework libraries, entrypoint, or application binaries — regardless of bugs or malicious intent in the scripts.
+
+**What is NOT protected**: Writable paths explicitly mounted by the operator (log directories, PVC data, hostPath mounts). This is by design — the operator controls the trust boundary.
+
+**State file protection**: The entrypoint cleans stale/fake state files before writing its own (see `rm -f` in entrypoint.sh), preventing injected pre-scripts from poisoning sidecar coordination with fake `main.status` or `main.pid` values.
 
 ## Architecture Relationship
 
