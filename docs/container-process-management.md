@@ -74,11 +74,11 @@ Kubernetes sends SIGTERM
 |  |                                                         | |
 |  |  [1] source lib/*.sh                Load libraries      | |
 |  |  [2] run_phase mount/pre-script     Runtime pre-hooks   | |
-|  |  [3] write_state running            Signal to sidecars  | |
-|  |  [4] trap SIGTERM -> cleanup         Register handler   | |
-|  |  [5] "$@" &                          Start main process | |
-|  |  [6] write_pid $MAIN_PID            Publish PID         | |
-|  |  [7] write_state running            Signal to sidecars  | |
+|  |  [3] trap '' SIGTERM SIGINT         Block signals       | |
+|  |  [4] "$@" & MAIN_PID=$!             Start main process  | |
+|  |  [5] write_pid $MAIN_PID            Publish PID         | |
+|  |  [6] write_state running            Signal to sidecars  | |
+|  |  [7] trap cleanup SIGTERM SIGINT    Restore handler     | |
 |  |  [8] wait $MAIN_PID                  Wait               | |
 |  |                                                         | |
 |  |  -- On SIGTERM received --                              | |
@@ -114,8 +114,8 @@ _kubedoop_log() {
 }
 
 log_info()  { _kubedoop_log "INFO"  "$@"; }
-log_warn()  { _kubedoop_log "WARN"  "$@"; }
-log_error() { _kubedoop_log "ERROR" "$@"; }
+log_warn()  { _kubedoop_log "WARN"  "$@" >&2; }
+log_error() { _kubedoop_log "ERROR" "$@" >&2; }
 log_debug() { [[ "${KUBEDOOP_DEBUG:-false}" == "true" ]] && _kubedoop_log "DEBUG" "$@"; }
 ```
 
@@ -134,7 +134,10 @@ discover_scripts() {
         return 0
     fi
 
-    # Only match .sh files that are executable by the current container user
+    # Only match .sh files that have any execute bit set (owner, group, or other).
+    # Note: -executable is GNU find specific (not BSD/macOS). Acceptable here since
+    # the target environment is ubi9-minimal (Linux, GNU findutils).
+    # With ConfigMap defaultMode: 0755, this correctly matches all executable scripts.
     find "$phase_dir" -maxdepth 1 -type f -name '*.sh' -executable \
         | sort
 }
@@ -200,8 +203,14 @@ _atomic_write() {
     local target="$1"
     local content="$2"
     local tmp="${target}.tmp.$$"
-    printf '%s' "$content" > "$tmp"
-    mv -f "$tmp" "$target"
+    if ! printf '%s\n' "$content" > "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! mv -f "$tmp" "$target"; then
+        rm -f "$tmp"
+        return 1
+    fi
 }
 
 # Write main process PID
@@ -231,11 +240,18 @@ wait_for_state() {
     local expected="$1"
     local timeout="${2:-300}"
 
-    local elapsed=0
-    while [[ $elapsed -lt $timeout ]]; do
-        # Check current state
-        if [[ -f "${KUBEDOOP_RUN_DIR}/main.status" ]] \
-            && [[ "$(cat "${KUBEDOOP_RUN_DIR}/main.status" 2>/dev/null)" == "$expected" ]]; then
+    local start now
+    start=$(date +%s)
+    while true; do
+        now=$(date +%s)
+        if (( now - start >= timeout )); then
+            break
+        fi
+
+        # Check current state (strip trailing newline from file content)
+        local current_state
+        current_state=$(cat "${KUBEDOOP_RUN_DIR}/main.status" 2>/dev/null) || continue
+        if [[ "$current_state" == "$expected" ]]; then
             return 0
         fi
 
@@ -253,7 +269,6 @@ wait_for_state() {
         else
             sleep 1
         fi
-        elapsed=$((elapsed + 1))
     done
 
     log_error "Timeout waiting for main.status = $expected (${timeout}s)"
@@ -297,7 +312,7 @@ if ! run_phase "pre-script" "${KUBEDOOP_MOUNT_DIR}/pre-script"; then
     exit 1
 fi
 
-# --- Signal handling and graceful shutdown ---
+# --- Clean stale state and register signal handler ---
 MAIN_PID=""
 EXIT_CODE=0
 _CLEANUP_RUNNING=0
@@ -311,16 +326,16 @@ cleanup() {
 
     log_info "Starting shutdown cleanup"
 
-    # Notify sidecars: main container is stopping
-    write_state "stopping"
-
-    # Forward SIGTERM to main process
+    # Only write "stopping" if main process is still alive (signal-triggered shutdown)
+    # On normal exit, the process is already dead — skip "stopping" to avoid misleading sidecars
     if [[ -n "$MAIN_PID" ]] && kill -0 "$MAIN_PID" 2>/dev/null; then
+        write_state "stopping"
+
         log_info "Forwarding SIGTERM to main process (PID: $MAIN_PID)"
         kill -TERM "$MAIN_PID" 2>/dev/null || true
 
         # Wait for main process to exit (with timeout protection)
-        local timeout="${KUBEDOOP_SHUTDOWN_TIMEOUT:-30}"
+        local timeout="${KUBEDOOP_KILL_TIMEOUT:-30}"
         local elapsed=0
         while kill -0 "$MAIN_PID" 2>/dev/null && [[ $elapsed -lt $timeout ]]; do
             sleep 1
@@ -343,7 +358,15 @@ cleanup() {
     log_info "Shutdown complete"
 }
 
-trap cleanup SIGTERM SIGINT
+# Register trap BEFORE starting the process to close the SIGTERM race window.
+# Block signals during process start to prevent cleanup() from firing with empty MAIN_PID.
+trap '' SIGTERM SIGINT
+
+# --- Clean stale state files ---
+# Runs AFTER pre-scripts but BEFORE the main process starts.
+# This ensures any state files written by pre-scripts or previous runs
+# are cleaned before the entrypoint writes authoritative state.
+rm -f "${KUBEDOOP_RUN_DIR}"/main.{pid,status,exit_code}
 
 # --- Start main process ---
 if [[ $# -eq 0 ]]; then
@@ -351,15 +374,14 @@ if [[ $# -eq 0 ]]; then
     exit 1
 fi
 
-# Clean stale/fake state files left by previous runs or injected scripts.
-# This ensures sidecars only see state written by this entrypoint instance.
-rm -f "${KUBEDOOP_RUN_DIR}"/main.{pid,status,exit_code}
-
-"$@" &
-MAIN_PID=$!
+# Start process and capture PID atomically (same logical line as backgrounding)
+"$@" & MAIN_PID=$!
 write_pid "$MAIN_PID"
 write_state "running"
 log_info "Main process started (PID: $MAIN_PID): $*"
+
+# Restore signal handler now that MAIN_PID is set — cleanup() can forward signals
+trap cleanup SIGTERM SIGINT
 
 # Wait for main process to exit
 wait $MAIN_PID || EXIT_CODE=$?
@@ -377,6 +399,7 @@ exit $EXIT_CODE
 # Append to existing kubedoop-base Dockerfile
 
 # Install init system (e.g., tini, dumb-init — to be decided)
+# Note: RUN <<EOF heredoc syntax requires BuildKit or Docker 20.10+
 RUN <<EOF
     microdnf install tini
     microdnf clean all
@@ -384,19 +407,31 @@ RUN <<EOF
 EOF
 
 # Deploy universal entrypoint framework
-COPY kubedoop/lib/ /kubedoop/lib/
-COPY kubedoop/bin/entrypoint.sh /kubedoop/bin/entrypoint.sh
-RUN chmod +x /kubedoop/bin/entrypoint.sh \
+# Framework files: root-owned, world-readable/executable, NOT writable by kubedoop
+COPY --chown=root:root kubedoop/lib/ /kubedoop/lib/
+COPY --chown=root:root kubedoop/bin/entrypoint.sh /kubedoop/bin/entrypoint.sh
+RUN chmod -R 0755 /kubedoop/lib/ /kubedoop/bin/ \
     && mkdir -p /kubedoop/mount/{pre-script,post-script} \
-    && chown -R kubedoop:kubedoop /kubedoop/mount/ \
+    && chown -R root:root /kubedoop/mount/ \
     && chmod -R 0755 /kubedoop/mount/
+
+# State directory: the ONLY writable path for kubedoop user
+RUN mkdir -p /kubedoop/run \
+    && chown kubedoop:kubedoop /kubedoop/run \
+    && chmod 0755 /kubedoop/run
 
 # Init process as PID 1
 # No -g flag: init forwards signals only to direct child process.
 # The entrypoint.sh manages signal propagation explicitly via trap.
 #
+# IMPORTANT: tini and dumb-init have different default signal behaviors:
+#   tini:      Forwards signals to direct child only (no -g).
+#   dumb-init: Uses process groups by default (effectively -g).
+# If switching from tini to dumb-init, use --single-child flag to match
+# the signal semantics assumed by this design, or update the trap logic.
+#
 # tini:      ENTRYPOINT ["tini", "--", "/kubedoop/bin/entrypoint.sh"]
-# dumb-init: ENTRYPOINT ["dumb-init", "--", "/kubedoop/bin/entrypoint.sh"]
+# dumb-init: ENTRYPOINT ["dumb-init", "--single-child", "--", "/kubedoop/bin/entrypoint.sh"]
 ENTRYPOINT ["tini", "--", "/kubedoop/bin/entrypoint.sh"]
 ```
 
@@ -611,6 +646,18 @@ source /kubedoop/lib/pod-state.sh
 
 log_info "Sidecar watchdog starting (mode: ${KUBEDOOP_SIDECAR_MODE})"
 
+# Signal handler: clean up child processes on SIGTERM/SIGINT
+# Without this, K8s SIGTERM (native mode) would kill the watchdog but orphan
+# the sidecar process and the background monitor.
+_watchdog_cleanup() {
+    log_info "Watchdog received shutdown signal"
+    kill -TERM "$SIDECAR_PID" 2>/dev/null || true
+    kill -TERM "$MONITOR_PID" 2>/dev/null || true
+    wait "$SIDECAR_PID" 2>/dev/null || true
+    wait "$MONITOR_PID" 2>/dev/null || true
+}
+trap _watchdog_cleanup SIGTERM SIGINT
+
 # Wait for main container to be ready
 # Also exits early if main.exit_code appears (main container crashed during startup)
 wait_for_state "running" "${KUBEDOOP_STARTUP_TIMEOUT:-120}" || {
@@ -622,10 +669,12 @@ log_info "Main container is running"
 # Start sidecar main process
 # The sidecar command must be provided via KUBEDOOP_SIDECAR_CMD env var or as script arguments.
 # Example: KUBEDOOP_SIDECAR_CMD="vector --config /etc/vector/vector.toml"
+# Note: KUBEDOOP_SIDECAR_CMD is split on whitespace into an array to avoid eval injection.
 if [[ $# -gt 0 ]]; then
     "$@" &
 elif [[ -n "${KUBEDOOP_SIDECAR_CMD:-}" ]]; then
-    eval "$KUBEDOOP_SIDECAR_CMD" &
+    read -ra _sidecar_cmd <<< "$KUBEDOOP_SIDECAR_CMD"
+    "${_sidecar_cmd[@]}" &
 else
     log_error "No sidecar command specified. Use KUBEDOOP_SIDECAR_CMD or pass command as arguments."
     exit 1
@@ -652,15 +701,18 @@ case "${KUBEDOOP_SIDECAR_MODE}" in
         # K8s sends SIGTERM to sidecar after all regular containers exit.
         # The sidecar process (vector) handles SIGTERM with its own graceful shutdown.
         wait "$SIDECAR_PID" || true
+        wait "$MONITOR_PID" 2>/dev/null || true
         log_info "Sidecar process exited"
         ;;
     legacy)
         # Pre-1.28: Wait for main container to fully stop, then exit voluntarily.
         # Without this, the sidecar would keep running and the Pod would never terminate.
-        wait_for_state "stopped" "${KUBEDOOP_SHUTDOWN_TIMEOUT:-30}" || true
+        wait_for_state "stopped" "${KUBEDOOP_STATE_WAIT_TIMEOUT:-60}" || true
         log_info "Main container stopped, terminating sidecar"
         kill -TERM "$SIDECAR_PID" 2>/dev/null || true
+        kill -TERM "$MONITOR_PID" 2>/dev/null || true
         wait "$SIDECAR_PID" 2>/dev/null || true
+        wait "$MONITOR_PID" 2>/dev/null || true
         log_info "Sidecar process terminated"
         ;;
     *)
@@ -789,28 +841,6 @@ kubedoop user: │   read+exec     │   read+exec     │   read+exec     │  
                └─── ✗ write      └─── ✗ write      └─── ✗ write      └─── ✗ write      └─── ✓ write
 ```
 
-### Dockerfile Integration
-
-```dockerfile
-# Framework files: root-owned, world-readable/executable, NOT writable by kubedoop
-COPY --chown=root:root kubedoop/lib/ /kubedoop/lib/
-COPY --chown=root:root kubedoop/bin/entrypoint.sh /kubedoop/bin/entrypoint.sh
-RUN chmod -R 0755 /kubedoop/lib/ /kubedoop/bin/
-
-# Application files: same protection
-COPY --chown=root:root --from=builder /kubedoop/app/ /kubedoop/app/
-
-# Mount points: root-owned directories, content managed by K8s volumes
-RUN mkdir -p /kubedoop/mount/{pre-script,post-script} \
-    && chown -R root:root /kubedoop/mount/ \
-    && chmod -R 0755 /kubedoop/mount/
-
-# State directory: the ONLY writable path for kubedoop user
-RUN mkdir -p /kubedoop/run \
-    && chown kubedoop:kubedoop /kubedoop/run \
-    && chmod 0755 /kubedoop/run
-```
-
 ### Kubernetes Layer: Read-Only Root Filesystem
 
 For maximum protection, use Kubernetes `readOnlyRootFilesystem` and mount writable paths explicitly:
@@ -860,7 +890,7 @@ The security model protects the **container image** (framework + application), n
 
 **What is NOT protected**: Writable paths explicitly mounted by the operator (log directories, PVC data, hostPath mounts). This is by design — the operator controls the trust boundary.
 
-**State file protection**: The entrypoint cleans stale/fake state files before writing its own (see `rm -f` in entrypoint.sh), preventing injected pre-scripts from poisoning sidecar coordination with fake `main.status` or `main.pid` values.
+**State file protection**: The entrypoint cleans stale/fake state files after pre-scripts run but before the main process starts (see `rm -f` in entrypoint.sh). This prevents injected pre-scripts from poisoning sidecar coordination with fake `main.status` or `main.pid` values. Pre-scripts are trusted not to write state files between the cleanup and the real state writes (a sub-millisecond window).
 
 ## Architecture Relationship
 
