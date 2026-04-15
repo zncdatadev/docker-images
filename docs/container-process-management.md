@@ -43,22 +43,20 @@ Product entrypoint:  /kubedoop/bin/start-app.sh   (product-specific, any name ex
 
 ```
 /kubedoop/
-├── bin/
-│   └── entrypoint.sh              # Universal entrypoint (shared across all images)
-├── lib/
-│   ├── log.sh                     # Logging functions
-│   ├── run-phase.sh               # Script discovery and execution engine
-│   └── pod-state.sh               # Pod state file management
-├── mount/                         # Runtime injection layer (fixed mount points)
-│   ├── pre-script/                # Scripts to run before main process (auto-discovered)
-│   │   └── (empty by default — populated by K8s Volume mount at runtime)
-│   └── post-script/               # Scripts to run after main process exits (auto-discovered)
-│       └── (empty by default — populated by K8s Volume mount at runtime)
-├── app/                           # Application files
-└── run/                           # Shared Pod state (mounted via emptyDir)
-    ├── main.pid                   # Main process PID (written on startup)
-    ├── main.status                # running → stopping → stopped
-    └── main.exit_code             # Exit code (written on exit)
+├── bin/          root:root 0755  # Universal entrypoint (shared across all images)
+│   └── entrypoint.sh
+├── lib/          root:root 0755  # Framework libraries
+│   ├── log.sh
+│   ├── run-phase.sh
+│   └── pod-state.sh
+├── mount/        root:root 0755  # Runtime injection layer (fixed mount points)
+│   ├── pre-script/               # K8s Volume managed at runtime
+│   └── post-script/              # K8s Volume managed at runtime
+├── app/          root:root 0755  # Application files
+└── run/          kubedoop:kubedoop 0755  # Shared Pod state (emptyDir, writable)
+    ├── main.pid
+    ├── main.status
+    └── main.exit_code
 ```
 
 ## Execution Flow
@@ -761,6 +759,94 @@ Validation: Signal delivery works correctly, shutdown behavior unchanged.
 - Operator mounts ConfigMap into `/kubedoop/mount/pre-script/`
 - Operator mounts ConfigMap into `/kubedoop/mount/post-script/`
 - Scripts auto-discovered and executed
+
+## Security: Runtime Script Isolation
+
+Runtime script injection introduces a trust boundary: operators can inject arbitrary code that runs inside the container. The framework must ensure injected scripts cannot tamper with the framework itself or application files.
+
+### Threat Model
+
+| Threat | Target | Impact |
+|--------|--------|--------|
+| Framework tampering | `/kubedoop/bin/`, `/kubedoop/lib/` | Bypass signal handling, disable cleanup, modify behavior |
+| Application tampering | `/kubedoop/app/`, product directories | Replace JARs, modify configs, inject malicious code |
+| Sensitive data access | Credential files, secrets | Expose secrets to external systems |
+| State file manipulation | `/kubedoop/run/` | Confuse sidecar coordination |
+
+### Defense: File Ownership Separation
+
+The core principle is **root owns, kubedoop executes**. Injected scripts run as `kubedoop` (UID 1001) and can only write to `/kubedoop/run/`.
+
+```
+Ownership:     root:root         root:root         root:root         root:root         kubedoop:kubedoop
+Permissions:   0755              0755              0755              0755              0755
+               ┌─── bin/         ┌─── lib/         ┌─── mount/       ┌─── app/         ┌─── run/
+kubedoop user: │   read+exec     │   read+exec     │   read+exec     │   read+exec     │   read+write
+               └─── ✗ write      └─── ✗ write      └─── ✗ write      └─── ✗ write      └─── ✓ write
+```
+
+### Dockerfile Integration
+
+```dockerfile
+# Framework files: root-owned, world-readable/executable, NOT writable by kubedoop
+COPY --chown=root:root kubedoop/lib/ /kubedoop/lib/
+COPY --chown=root:root kubedoop/bin/entrypoint.sh /kubedoop/bin/entrypoint.sh
+RUN chmod -R 0755 /kubedoop/lib/ /kubedoop/bin/
+
+# Application files: same protection
+COPY --chown=root:root --from=builder /kubedoop/app/ /kubedoop/app/
+
+# Mount points: root-owned directories, content managed by K8s volumes
+RUN mkdir -p /kubedoop/mount/{pre-script,post-script} \
+    && chown -R root:root /kubedoop/mount/ \
+    && chmod -R 0755 /kubedoop/mount/
+
+# State directory: the ONLY writable path for kubedoop user
+RUN mkdir -p /kubedoop/run \
+    && chown kubedoop:kubedoop /kubedoop/run \
+    && chmod 0755 /kubedoop/run
+```
+
+### Kubernetes Layer: Read-Only Root Filesystem
+
+For maximum protection, use Kubernetes `readOnlyRootFilesystem` and mount writable paths explicitly:
+
+```yaml
+securityContext:
+  readOnlyRootFilesystem: true
+  fsGroup: 1001
+
+# Mount writable emptyDir for state files only
+volumes:
+  - name: pod-state
+    emptyDir: {}
+  - name: tmp
+    emptyDir: {}    # Application tmp if needed
+
+containers:
+  - name: app
+    volumeMounts:
+      - name: pod-state
+        mountPath: /kubedoop/run
+      - name: tmp
+        mountPath: /tmp
+```
+
+With `readOnlyRootFilesystem: true`:
+- All container filesystem layers are immutable at runtime
+- Only explicitly mounted volumes (emptyDir, ConfigMap) are writable
+- Even if a script gains elevated privileges, it cannot modify the root filesystem
+- Combined with file ownership, this provides defense-in-depth
+
+### Defense-in-Depth Summary
+
+| Layer | Mechanism | Protects Against |
+|-------|-----------|-----------------|
+| File ownership | `root:root 0755` on framework/app | kubedoop user cannot overwrite files |
+| K8s security | `readOnlyRootFilesystem: true` | Runtime filesystem immutability |
+| K8s security | `runAsNonRoot: true`, `runAsUser: 1001` | Container never runs as root |
+| K8s security | `allowPrivilegeEscalation: false` | Scripts cannot gain root via setuid |
+| Pod spec | Only `/kubedoop/run/` as emptyDir | Write surface limited to state files |
 
 ## Architecture Relationship
 
