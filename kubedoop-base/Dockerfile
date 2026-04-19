@@ -70,7 +70,8 @@ RUN chmod -R 0755 /kubedoop/lib/ /kubedoop/bin/ \
 # - readOnlyRootFilesystem: true (with /kubedoop/run as emptyDir)
 # - allowPrivilegeEscalation: false
 # - Runtime script injection: only ConfigMap/projected volumes in /kubedoop/mount/
-USER 1001
+# Note: kubedoop-base runs as root to allow derived images to build freely.
+# Derived images should set USER 1001 at the end of their final stage.
 
 # Init process as PID 1
 # No -g flag: tini forwards signals only to direct child process.
