@@ -49,7 +49,7 @@ Product entrypoint:  /kubedoop/bin/start-app.sh   (product-specific, any name ex
 │   ├── log.sh
 │   ├── run-phase.sh
 │   ├── signal.sh
-│   └── pod-state.sh
+│   └── pod-state.sh           (deferred)
 ├── mount/        root:root 0755  # Runtime injection layer (fixed mount points)
 │   ├── pre-script/               # K8s Volume managed at runtime
 │   └── post-script/              # K8s Volume managed at runtime
@@ -94,6 +94,16 @@ Kubernetes sends SIGTERM
 > **Note on error handling**: The entrypoint uses `set -uo pipefail` (without `-e`).
 > Signal-aware shell scripts must not use `set -e` because trap handlers and `set -e`
 > interact unpredictably. All error handling is explicit.
+
+> **Note on signal handler safety**: `stop_process()` uses `sleep 1` in a polling loop
+> inside a trap handler. While `sleep` is not POSIX async-signal-safe, this is a
+> pragmatic trade-off in shell-based signal handling. The re-entrancy guard and trap
+> disarm in `cleanup()` mitigate the risk. This is acceptable for the target environment
+> (ubi9-minimal, bash 4.x) where heavy signal pressure is uncommon.
+
+> **Note on KUBEDOOP_KILL_TIMEOUT**: Must be a positive integer >= 1. A value of 0
+> (immediate SIGKILL) is intentionally not supported — the graceful shutdown window
+> is always at least 1 second.
 
 ### lib/log.sh — Unified Logging
 
@@ -157,8 +167,8 @@ discover_scripts() {
     # SECURITY: Only execute scripts owned by root (uid 0) to prevent injection
     # from non-root writable volumes (emptyDir, PVC, hostPath).
     find "$phase_dir" -maxdepth 1 -type f -name '*.sh' -executable \
-        -uid 0 \
-        | sort
+        -uid 0 -print0 \
+        | sort -z
 }
 
 # Run scripts sequentially (for pre-script / post-script)
@@ -167,21 +177,15 @@ run_phase() {
     local phase_name="$1"
     local phase_dir="$2"
 
-    local scripts
-    scripts=$(discover_scripts "$phase_dir") || {
-        log_error "Phase '$phase_name': failed to discover scripts in $phase_dir"
-        return 1
-    }
-
-    if [[ -z "$scripts" ]]; then
-        log_info "Phase '$phase_name': no scripts found in $phase_dir"
+    if [[ ! -d "$phase_dir" ]]; then
         return 0
     fi
 
-    log_info "Phase '$phase_name' starting..."
-
     local count=0
-    while IFS= read -r script; do
+    local found_any=false
+
+    while IFS= read -r -d '' script; do
+        found_any=true
         local name
         name=$(basename "$script")
         log_info "Phase '$phase_name': running $name"
@@ -193,7 +197,12 @@ run_phase() {
             log_error "Phase '$phase_name': $name failed with exit code $rc"
             return 1
         fi
-    done <<< "$scripts"
+    done < <(discover_scripts "$phase_dir")
+
+    if [[ "$found_any" == false ]]; then
+        log_info "Phase '$phase_name': no scripts found in $phase_dir"
+        return 0
+    fi
 
     log_info "Phase '$phase_name': completed ($count scripts)"
     return 0
@@ -294,7 +303,7 @@ stop_process() {
 #   5. Run post-script phase hooks
 cleanup() {
     # Prevent re-entrant execution (trap + fallthrough race)
-    if [[ "${_CLEANUP_RUNNING}" -eq 1 ]]; then
+    if [[ "${_CLEANUP_RUNNING:-0}" -eq 1 ]]; then
         return 0
     fi
     _CLEANUP_RUNNING=1
@@ -304,11 +313,6 @@ cleanup() {
 
     log_info "Starting shutdown cleanup"
 
-    # Signal to sidecars: main container is stopping
-    if [[ -n "$MAIN_PID" ]] && kill -0 "$MAIN_PID" 2>/dev/null; then
-        write_state "stopping"
-    fi
-
     stop_process "$MAIN_PID" "$KUBEDOOP_KILL_TIMEOUT"
 
     # Capture real exit code if process was reaped during signal path
@@ -317,9 +321,6 @@ cleanup() {
     fi
 
     log_info "Main process stopped"
-
-    # Signal to sidecars: main container has stopped
-    write_state "stopped"
 
     # Phase: Runtime post-script hooks (auto-discovered from mount)
     run_phase "post-script" "${KUBEDOOP_MOUNT_DIR}/post-script" || true
@@ -350,8 +351,6 @@ run_lifecycle() {
 
     # Start process and capture PID atomically (same logical line as backgrounding)
     "$@" & MAIN_PID=$!
-    write_pid "$MAIN_PID"
-    write_state "running"
 
     # Restore signal handler immediately after PID capture — minimizes race window
     trap cleanup SIGTERM SIGINT
@@ -360,14 +359,17 @@ run_lifecycle() {
 
     # Wait for main process to exit
     wait $MAIN_PID || EXIT_CODE=$?
-    write_exit_code "$EXIT_CODE"
 
     # Run cleanup (if not already triggered by signal trap)
-    cleanup
+    if [[ "${_CLEANUP_RUNNING:-0}" -ne 1 ]]; then
+        cleanup
+    fi
 }
 ```
 
 ### lib/pod-state.sh — Pod State File Management
+
+> **Status: Deferred** — This library is designed but not yet deployed. It will be included in a future phase when sidecar coordination is implemented.
 
 ```bash
 #!/bin/bash
@@ -513,9 +515,6 @@ if ! run_phase "pre-script" "${KUBEDOOP_MOUNT_DIR}/pre-script"; then
     log_error "Pre-script phase failed, aborting startup"
     exit 1
 fi
-
-# --- Clean stale state files ---
-rm -f "${KUBEDOOP_RUN_DIR}"/main.{pid,status,exit_code}
 
 # --- Phase 2: Start main process and manage lifecycle ---
 if [[ $# -eq 0 ]]; then
@@ -769,6 +768,8 @@ Main Container:                    Sidecar Container (vector):
 | `main.exit_code` | entrypoint.sh | sidecar | Exit code number | After main process exits |
 
 ### Sidecar Watchdog Script
+
+> **Status: Not yet implemented** — This script is designed but not deployed. It will be shipped with the pod-state coordination phase.
 
 ```bash
 #!/bin/bash

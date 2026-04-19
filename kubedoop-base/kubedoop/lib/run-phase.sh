@@ -10,7 +10,7 @@
 #   $1 - Directory path to scan
 #
 # Output:
-#   stdout - Sorted list of matching script paths (one per line), empty if none found
+#   stdout - Null-delimited sorted list of matching script paths, empty if none found
 #
 # Returns:
 #   0 - Always (missing directory is not an error)
@@ -28,8 +28,8 @@ discover_scripts() {
     # SECURITY: Only execute scripts owned by root (uid 0) to prevent injection
     # from non-root writable volumes (emptyDir, PVC, hostPath).
     find "$phase_dir" -maxdepth 1 -type f -name '*.sh' -executable \
-        -uid 0 \
-        | sort
+        -uid 0 -print0 \
+        | sort -z
 }
 
 # Execute all discovered scripts in a phase directory sequentially.
@@ -47,21 +47,15 @@ run_phase() {
     local phase_name="$1"
     local phase_dir="$2"
 
-    local scripts
-    scripts=$(discover_scripts "$phase_dir") || {
-        log_error "Phase '$phase_name': failed to discover scripts in $phase_dir"
-        return 1
-    }
-
-    if [[ -z "$scripts" ]]; then
-        log_info "Phase '$phase_name': no scripts found in $phase_dir"
+    if [[ ! -d "$phase_dir" ]]; then
         return 0
     fi
 
-    log_info "Phase '$phase_name' starting..."
-
     local count=0
-    while IFS= read -r script; do
+    local found_any=false
+
+    while IFS= read -r -d '' script; do
+        found_any=true
         local name
         name=$(basename "$script")
         log_info "Phase '$phase_name': running $name"
@@ -73,7 +67,12 @@ run_phase() {
             log_error "Phase '$phase_name': $name failed with exit code $rc"
             return 1
         fi
-    done <<< "$scripts"
+    done < <(discover_scripts "$phase_dir")
+
+    if [[ "$found_any" == false ]]; then
+        log_info "Phase '$phase_name': no scripts found in $phase_dir"
+        return 0
+    fi
 
     log_info "Phase '$phase_name': completed ($count scripts)"
     return 0

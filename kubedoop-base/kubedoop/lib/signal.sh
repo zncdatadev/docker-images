@@ -96,7 +96,7 @@ stop_process() {
 #   0 - Always (best-effort cleanup, errors are logged but not propagated)
 cleanup() {
     # Prevent re-entrant execution (trap + fallthrough race)
-    if [[ "${_CLEANUP_RUNNING}" -eq 1 ]]; then
+    if [[ "${_CLEANUP_RUNNING:-0}" -eq 1 ]]; then
         return 0
     fi
     _CLEANUP_RUNNING=1
@@ -159,5 +159,7 @@ run_lifecycle() {
     wait $MAIN_PID || EXIT_CODE=$?
 
     # Run cleanup (if not already triggered by signal trap)
-    cleanup
+    if [[ "${_CLEANUP_RUNNING:-0}" -ne 1 ]]; then
+        cleanup
+    fi
 }

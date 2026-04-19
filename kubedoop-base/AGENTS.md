@@ -9,7 +9,7 @@ The foundational base image for the entire Kubedoop stack. Creates the kubedoop 
 - Base image: registry.access.redhat.com/ubi9/ubi-minimal:9.6
 - Build approach: Creates kubedoop user/group (uid/gid 1001, home /kubedoop). Installs minimal utils (findutils, iputils, less, procps, tar) and tini as init system. Deploys universal entrypoint framework (signal forwarding, runtime script injection). Sets OCI image labels.
 - ENTRYPOINT: `["tini", "--", "/kubedoop/bin/entrypoint.sh"]` — tini as PID 1 for signal delivery and zombie reaping, entrypoint.sh manages graceful shutdown and runtime script injection
-- USER: 1001 (kubedoop) — all runtime processes run as non-root
+- USER: root — derived images must set USER 1001 (kubedoop) at the end of their final stage
 
 ## Version Schema
 See `versions.yaml` for current values. Structure:
