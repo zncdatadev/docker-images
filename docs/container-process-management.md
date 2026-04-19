@@ -48,6 +48,7 @@ Product entrypoint:  /kubedoop/bin/start-app.sh   (product-specific, any name ex
 ├── lib/          root:root 0755  # Framework libraries
 │   ├── log.sh
 │   ├── run-phase.sh
+│   ├── signal.sh
 │   └── pod-state.sh
 ├── mount/        root:root 0755  # Runtime injection layer (fixed mount points)
 │   ├── pre-script/               # K8s Volume managed at runtime
@@ -83,11 +84,10 @@ Kubernetes sends SIGTERM
 |  |                                                         | |
 |  |  -- On SIGTERM received --                              | |
 |  |  [9] write_state stopping           Signal to sidecars  | |
-|  |  [10] kill -TERM $MAIN_PID            Forward signal     | |
-|  |  [11] wait $MAIN_PID                 Wait for exit      | |
-|  |  [12] write_state stopped            Signal to sidecars | |
-|  |  [13] run_phase mount/post-script    Runtime post-hooks | |
-|  |  [14] exit $EXIT_CODE                Propagate exit     | |
+|  |  [10] stop_process $MAIN_PID       Graceful shutdown   | |
+|  |  [11] write_state stopped            Signal to sidecars | |
+|  |  [12] run_phase mount/post-script    Runtime post-hooks | |
+|  |  [13] exit $EXIT_CODE                Propagate exit     | |
 |  +---------------------------------------------------------+ |
 +--------------------------------------------------------------+
 ```
@@ -178,6 +178,71 @@ run_phase() {
 
     log_info "Phase '$phase_name': completed ($count scripts)"
     return 0
+}
+```
+
+### lib/signal.sh — Process Lifecycle Management
+
+```bash
+#!/bin/bash
+# /kubedoop/lib/signal.sh — Process lifecycle management
+#
+# Provides graceful process termination with configurable timeout.
+# SIGTERM → wait → SIGKILL escalation pattern.
+
+# Terminate a process gracefully with timeout escalation.
+#
+# Steps:
+#   1. If process is alive, send SIGTERM
+#   2. Wait up to timeout seconds for process to exit
+#   3. Escalate to SIGKILL on timeout
+#   4. Reap process to capture exit code and prevent zombies
+#
+# Arguments:
+#   $1 - PID to terminate
+#   $2 - Timeout in seconds before SIGKILL escalation
+#
+# Side effects:
+#   Sets STOP_EXIT_CODE to the reaped exit code (empty if PID is empty)
+#   Sets STOP_REAPED=1 if the process was reaped, 0 if no PID
+stop_process() {
+    local pid="$1"
+    local timeout="$2"
+
+    STOP_EXIT_CODE=""
+    STOP_REAPED=0
+
+    # Nothing to do if no PID
+    if [[ -z "$pid" ]]; then
+        return 0
+    fi
+
+    # Process already dead — try reap in case of signal path (interrupted wait)
+    if ! kill -0 "$pid" 2>/dev/null; then
+        wait "$pid" 2>/dev/null || STOP_EXIT_CODE=$?
+        STOP_REAPED=1
+        return 0
+    fi
+
+    log_info "Forwarding SIGTERM to main process (PID: $pid)"
+    kill -TERM "$pid" 2>/dev/null || true
+
+    # Wait for process to exit (with timeout protection)
+    local elapsed=0
+    while kill -0 "$pid" 2>/dev/null && [[ $elapsed -lt $timeout ]]; do
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+
+    # Force kill on timeout
+    if kill -0 "$pid" 2>/dev/null; then
+        log_warn "Main process did not exit in ${timeout}s, sending SIGKILL"
+        kill -KILL "$pid" 2>/dev/null || true
+    fi
+
+    # Reap process to capture exit code
+    wait "$pid" 2>/dev/null || STOP_EXIT_CODE=$?
+    STOP_REAPED=1
 }
 ```
 
@@ -324,29 +389,21 @@ cleanup() {
     fi
     _CLEANUP_RUNNING=1
 
+    # Disarm signal traps during cleanup to prevent nested handler execution
+    trap - SIGTERM SIGINT
+
     log_info "Starting shutdown cleanup"
 
     # Only write "stopping" if main process is still alive (signal-triggered shutdown)
-    # On normal exit, the process is already dead — skip "stopping" to avoid misleading sidecars
     if [[ -n "$MAIN_PID" ]] && kill -0 "$MAIN_PID" 2>/dev/null; then
         write_state "stopping"
+    fi
 
-        log_info "Forwarding SIGTERM to main process (PID: $MAIN_PID)"
-        kill -TERM "$MAIN_PID" 2>/dev/null || true
+    stop_process "$MAIN_PID" "${KUBEDOOP_KILL_TIMEOUT:-30}"
 
-        # Wait for main process to exit (with timeout protection)
-        local timeout="${KUBEDOOP_KILL_TIMEOUT:-30}"
-        local elapsed=0
-        while kill -0 "$MAIN_PID" 2>/dev/null && [[ $elapsed -lt $timeout ]]; do
-            sleep 1
-            elapsed=$((elapsed + 1))
-        done
-
-        # Force kill on timeout
-        if kill -0 "$MAIN_PID" 2>/dev/null; then
-            log_warn "Main process did not exit in ${timeout}s, sending SIGKILL"
-            kill -KILL "$MAIN_PID" 2>/dev/null || true
-        fi
+    # Capture real exit code if process was reaped during signal path
+    if [[ "$STOP_REAPED" -eq 1 && -n "$STOP_EXIT_CODE" ]]; then
+        EXIT_CODE="$STOP_EXIT_CODE"
     fi
 
     # Notify sidecars: main container has stopped
@@ -378,10 +435,11 @@ fi
 "$@" & MAIN_PID=$!
 write_pid "$MAIN_PID"
 write_state "running"
-log_info "Main process started (PID: $MAIN_PID): $*"
 
-# Restore signal handler now that MAIN_PID is set — cleanup() can forward signals
+# Restore signal handler immediately after PID capture — minimizes race window
 trap cleanup SIGTERM SIGINT
+
+log_info "Main process started (PID: $MAIN_PID): $*"
 
 # Wait for main process to exit
 wait $MAIN_PID || EXIT_CODE=$?
@@ -418,7 +476,10 @@ RUN chmod -R 0755 /kubedoop/lib/ /kubedoop/bin/ \
 # State directory: the ONLY writable path for kubedoop user
 RUN mkdir -p /kubedoop/run \
     && chown kubedoop:kubedoop /kubedoop/run \
-    && chmod 0755 /kubedoop/run
+    && chmod 1775 /kubedoop/run
+
+# Security: run as non-root user
+USER 1001
 
 # Init process as PID 1
 # No -g flag: init forwards signals only to direct child process.
@@ -793,7 +854,7 @@ For K8s >= 1.28, the native sidecar handles start/stop ordering. State files pro
 ### Phase 1: Infrastructure
 
 - kubedoop-base installs chosen init system
-- Deploy `lib/` and `bin/entrypoint.sh`
+- Deploy `lib/` (log.sh, run-phase.sh, signal.sh) and `bin/entrypoint.sh`
 - Create empty `mount/{pre-script,post-script}` directories
 
 ### Phase 2: Simple Products (Zero-script Products)

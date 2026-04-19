@@ -28,4 +28,5 @@ See `versions.yaml` for current values. Structure:
 - `kubedoop/bin/entrypoint.sh` — universal container entrypoint (signal forwarding, runtime injection)
 - `kubedoop/lib/log.sh` — unified logging framework
 - `kubedoop/lib/run-phase.sh` — script auto-discovery and execution engine
+- `kubedoop/lib/signal.sh` — graceful process termination (SIGTERM → SIGKILL escalation)
 - `versions.yaml` — version specifications

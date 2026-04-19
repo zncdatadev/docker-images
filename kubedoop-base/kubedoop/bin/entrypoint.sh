@@ -24,7 +24,8 @@ mkdir -p "${KUBEDOOP_RUN_DIR}"
 
 # Load common libraries.
 # Note: Libraries load in glob sort order. If a library depends on another,
-# it must document this requirement (e.g., run-phase.sh depends on log.sh).
+# it must document this requirement (e.g., run-phase.sh depends on log.sh,
+# signal.sh depends on log.sh).
 for lib in "${KUBEDOOP_HOME}/lib/"*.sh; do
     if [[ -f "$lib" ]]; then
         # shellcheck source=/dev/null
@@ -52,11 +53,9 @@ _CLEANUP_RUNNING=0
 # Steps:
 #   1. Guard against re-entrant execution (trap + fallthrough race)
 #   2. Disarm signal traps to prevent nested handler execution
-#   3. Forward SIGTERM to main process (if still alive)
-#   4. Wait for main process to exit (up to KUBEDOOP_KILL_TIMEOUT seconds)
-#   5. Escalate to SIGKILL if main process does not exit in time
-#   6. Reap main process and capture actual exit code
-#   7. Run post-script phase hooks
+#   3. Stop main process (SIGTERM → wait → SIGKILL escalation via stop_process)
+#   4. Capture actual exit code from reap
+#   5. Run post-script phase hooks
 #
 # Environment:
 #   MAIN_PID              - PID of the main process (set by caller)
@@ -76,34 +75,11 @@ cleanup() {
 
     log_info "Starting shutdown cleanup"
 
-    # Only forward signal if main process is still alive (signal-triggered shutdown)
-    if [[ -n "$MAIN_PID" ]] && kill -0 "$MAIN_PID" 2>/dev/null; then
-        log_info "Forwarding SIGTERM to main process (PID: $MAIN_PID)"
-        kill -TERM "$MAIN_PID" 2>/dev/null || true
+    stop_process "$MAIN_PID" "$KUBEDOOP_KILL_TIMEOUT"
 
-        # Wait for main process to exit (with timeout protection)
-        local elapsed=0
-        while kill -0 "$MAIN_PID" 2>/dev/null && [[ $elapsed -lt $KUBEDOOP_KILL_TIMEOUT ]]; do
-            sleep 1
-            elapsed=$((elapsed + 1))
-        done
-
-        # Force kill on timeout
-        if kill -0 "$MAIN_PID" 2>/dev/null; then
-            log_warn "Main process did not exit in ${KUBEDOOP_KILL_TIMEOUT}s, sending SIGKILL"
-            kill -KILL "$MAIN_PID" 2>/dev/null || true
-        fi
-    fi
-
-    # Reap main process to capture actual exit code and prevent zombies.
-    # On signal path: overrides interrupted-wait's 128+SIGNUM with real exit code.
-    # On normal path: process already reaped, wait returns 127, which we ignore.
-    if [[ -n "$MAIN_PID" ]]; then
-        local reap_code=0
-        wait "$MAIN_PID" 2>/dev/null || reap_code=$?
-        if [[ "$reap_code" -ne 127 ]]; then
-            EXIT_CODE="$reap_code"
-        fi
+    # Capture real exit code if process was reaped during signal path
+    if [[ "$STOP_REAPED" -eq 1 && -n "$STOP_EXIT_CODE" ]]; then
+        EXIT_CODE="$STOP_EXIT_CODE"
     fi
 
     log_info "Main process stopped"
