@@ -228,8 +228,8 @@ run_phase() {
 #   $2 - Timeout in seconds before SIGKILL escalation
 #
 # Side effects:
-#   Sets STOP_EXIT_CODE to the reaped exit code (empty if PID is empty)
-#   Sets STOP_REAPED=1 if the process was reaped, 0 if no PID
+#   Sets STOP_EXIT_CODE to the reaped exit code (empty if PID is empty or already reaped)
+#   Sets STOP_REAPED=1 if the process was reaped, 0 if no PID or already reaped
 stop_process() {
     local pid="$1"
     local timeout="$2"
@@ -244,8 +244,15 @@ stop_process() {
 
     # Process already dead — try reap in case of signal path (interrupted wait)
     if ! kill -0 "$pid" 2>/dev/null; then
-        wait "$pid" 2>/dev/null || STOP_EXIT_CODE=$?
-        STOP_REAPED=1
+        wait "$pid" 2>/dev/null
+        local rc=$?
+        if [[ $rc -eq 127 ]]; then
+            # Not a child of this shell — already reaped, exit code unknown
+            STOP_REAPED=0
+        else
+            STOP_EXIT_CODE=$rc
+            STOP_REAPED=1
+        fi
         return 0
     fi
 
@@ -266,8 +273,15 @@ stop_process() {
     fi
 
     # Reap process to capture exit code
-    wait "$pid" 2>/dev/null || STOP_EXIT_CODE=$?
-    STOP_REAPED=1
+    wait "$pid" 2>/dev/null
+    local rc=$?
+    if [[ $rc -eq 127 ]]; then
+        # Not a child of this shell — already reaped, exit code unknown
+        STOP_REAPED=0
+    else
+        STOP_EXIT_CODE=$rc
+        STOP_REAPED=1
+    fi
 }
 
 # Graceful shutdown handler. Invoked via SIGTERM/SIGINT trap by run_lifecycle.
@@ -366,6 +380,8 @@ run_lifecycle() {
 # All writes use atomic rename (write-to-tmp + mv) to prevent
 # sidecars from reading partial content.
 
+# Paths are locked at build time by entrypoint.sh (readonly).
+# These are fallback values for standalone testing only.
 KUBEDOOP_HOME="${KUBEDOOP_HOME:-/kubedoop}"
 KUBEDOOP_RUN_DIR="${KUBEDOOP_RUN_DIR:-${KUBEDOOP_HOME}/run}"
 
@@ -539,7 +555,7 @@ EOF
 COPY --chown=root:root kubedoop/lib/ /kubedoop/lib/
 COPY --chown=root:root kubedoop/bin/entrypoint.sh /kubedoop/bin/entrypoint.sh
 RUN chmod -R 0755 /kubedoop/lib/ /kubedoop/bin/ \
-    && mkdir -p /kubedoop/mount/{pre-script,post-script} \
+    && mkdir -p /kubedoop/mount/pre-script /kubedoop/mount/post-script \
     && chown -R root:root /kubedoop/mount/ \
     && mkdir -p /kubedoop/run \
     && chown kubedoop:kubedoop /kubedoop/run \
@@ -550,7 +566,8 @@ RUN chmod -R 0755 /kubedoop/lib/ /kubedoop/bin/ \
 # - readOnlyRootFilesystem: true (with /kubedoop/run as emptyDir)
 # - allowPrivilegeEscalation: false
 # - Runtime script injection: only ConfigMap/projected volumes in /kubedoop/mount/
-USER 1001
+# Note: kubedoop-base runs as root to allow derived images to build freely.
+# Derived images should set USER 1001 at the end of their final stage.
 
 # Init process as PID 1
 # No -g flag: tini forwards signals only to direct child process.

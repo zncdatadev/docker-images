@@ -59,7 +59,7 @@ EOF
 COPY --chown=root:root kubedoop/lib/ /kubedoop/lib/
 COPY --chown=root:root kubedoop/bin/entrypoint.sh /kubedoop/bin/entrypoint.sh
 RUN chmod -R 0755 /kubedoop/lib/ /kubedoop/bin/ \
-    && mkdir -p /kubedoop/mount/{pre-script,post-script} \
+    && mkdir -p /kubedoop/mount/pre-script /kubedoop/mount/post-script \
     && chown -R root:root /kubedoop/mount/ \
     && mkdir -p /kubedoop/run \
     && chown kubedoop:kubedoop /kubedoop/run \

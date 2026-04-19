@@ -23,8 +23,8 @@
 #   $2 - Timeout in seconds before SIGKILL escalation
 #
 # Side effects:
-#   Sets STOP_EXIT_CODE to the reaped exit code (empty if PID is empty)
-#   Sets STOP_REAPED=1 if the process was reaped, 0 if no PID
+#   Sets STOP_EXIT_CODE to the reaped exit code (empty if PID is empty or already reaped)
+#   Sets STOP_REAPED=1 if the process was reaped, 0 if no PID or already reaped
 stop_process() {
     local pid="$1"
     local timeout="$2"
@@ -39,8 +39,15 @@ stop_process() {
 
     # Process already dead — try reap in case of signal path (interrupted wait)
     if ! kill -0 "$pid" 2>/dev/null; then
-        wait "$pid" 2>/dev/null || STOP_EXIT_CODE=$?
-        STOP_REAPED=1
+        wait "$pid" 2>/dev/null
+        local rc=$?
+        if [[ $rc -eq 127 ]]; then
+            # Not a child of this shell — already reaped, exit code unknown
+            STOP_REAPED=0
+        else
+            STOP_EXIT_CODE=$rc
+            STOP_REAPED=1
+        fi
         return 0
     fi
 
@@ -61,8 +68,15 @@ stop_process() {
     fi
 
     # Reap process to capture exit code
-    wait "$pid" 2>/dev/null || STOP_EXIT_CODE=$?
-    STOP_REAPED=1
+    wait "$pid" 2>/dev/null
+    local rc=$?
+    if [[ $rc -eq 127 ]]; then
+        # Not a child of this shell — already reaped, exit code unknown
+        STOP_REAPED=0
+    else
+        STOP_EXIT_CODE=$rc
+        STOP_REAPED=1
+    fi
 }
 
 # Graceful shutdown handler. Invoked via SIGTERM/SIGINT trap by run_lifecycle.
