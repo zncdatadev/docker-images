@@ -1,6 +1,6 @@
 # Container Process Management Design
 
-> **Status**: Draft — Init system (tini / dumb-init / others) not yet finalized.
+> **Status**: Phase 1 (kubedoop-base) implemented. Init system: tini v0.19.0. Pod state and sidecar watchdog deferred.
 
 ## Design Goals
 
@@ -29,8 +29,8 @@ The separation is:
 
 Product entrypoints called via CMD must follow these rules:
 
-1. **Must ultimately `exec` into the long-running process** — not fork+exit. The universal framework tracks the main process PID; if the product entrypoint forks and exits, the PID tracking breaks.
-2. **Must not install its own SIGTERM trap** — the universal framework owns signal handling.
+1. **Must be the long-running process** — the framework backgrounds CMD and tracks its PID. The command (or product entrypoint script) should be the process that stays alive for the container's lifetime. Do not fork+exit.
+2. **Must not install its own SIGTERM trap** — the universal framework owns signal handling via `lib/signal.sh`.
 3. **Path convention**: product-specific entrypoints must live at `/kubedoop/bin/product-entrypoint.sh` (or any path other than `/kubedoop/bin/entrypoint.sh`) to avoid collision with the universal framework.
 
 Example:
@@ -54,7 +54,7 @@ Product entrypoint:  /kubedoop/bin/start-app.sh   (product-specific, any name ex
 │   ├── pre-script/               # K8s Volume managed at runtime
 │   └── post-script/              # K8s Volume managed at runtime
 ├── app/          root:root 0755  # Application files
-└── run/          kubedoop:kubedoop 0755  # Shared Pod state (emptyDir, writable)
+└── run/          kubedoop:kubedoop 1775  # Shared Pod state (emptyDir, writable, sticky bit)
     ├── main.pid
     ├── main.status
     └── main.exit_code
@@ -75,19 +75,16 @@ Kubernetes sends SIGTERM
 |  |                                                         | |
 |  |  [1] source lib/*.sh                Load libraries      | |
 |  |  [2] run_phase mount/pre-script     Runtime pre-hooks   | |
-|  |  [3] trap '' SIGTERM SIGINT         Block signals       | |
-|  |  [4] "$@" & MAIN_PID=$!             Start main process  | |
-|  |  [5] write_pid $MAIN_PID            Publish PID         | |
-|  |  [6] write_state running            Signal to sidecars  | |
-|  |  [7] trap cleanup SIGTERM SIGINT    Restore handler     | |
-|  |  [8] wait $MAIN_PID                  Wait               | |
+|  |  [3] run_lifecycle "$@"             Start + manage      | |
+|  |      ├── trap '' SIGTERM SIGINT     Block signals       | |
+|  |      ├── "$@" & MAIN_PID=$!         Background CMD      | |
+|  |      ├── trap cleanup SIGTERM SIGINT Restore handler    | |
+|  |      └── wait $MAIN_PID             Wait for exit       | |
 |  |                                                         | |
-|  |  -- On SIGTERM received --                              | |
-|  |  [9] write_state stopping           Signal to sidecars  | |
-|  |  [10] stop_process $MAIN_PID       Graceful shutdown   | |
-|  |  [11] write_state stopped            Signal to sidecars | |
-|  |  [12] run_phase mount/post-script    Runtime post-hooks | |
-|  |  [13] exit $EXIT_CODE                Propagate exit     | |
+|  |  -- On SIGTERM received (via cleanup) --                 | |
+|  |  [4] stop_process $MAIN_PID         Graceful shutdown   | |
+|  |  [5] run_phase mount/post-script    Runtime post-hooks  | |
+|  |  [6] exit $EXIT_CODE                Propagate exit      | |
 |  +---------------------------------------------------------+ |
 +--------------------------------------------------------------+
 ```
@@ -103,20 +100,39 @@ Kubernetes sends SIGTERM
 ```bash
 #!/bin/bash
 # /kubedoop/lib/log.sh — Unified log output
+#
+# Provides structured logging with ISO 8601 timestamps.
+# Log prefix is configurable via __KUBEDOOP_LOG_PREFIX (default: "kubedoop").
+# Debug output is gated by KUBEDOOP_DEBUG=true.
 
 __KUBEDOOP_LOG_PREFIX="${__KUBEDOOP_LOG_PREFIX:-kubedoop}"
 
+# Internal log formatter. Strips control characters to prevent log injection.
+#
+# Arguments:
+#   $1    - Log level (INFO, WARN, ERROR, DEBUG)
+#   $2..  - Message strings
+#
+# Output:
+#   stdout - Formatted log line: "[TIMESTAMP] [PREFIX] [LEVEL] MESSAGE"
 _kubedoop_log() {
     local level="$1"; shift
     local timestamp
     timestamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
-    printf "[%s] [%s] [%s] %s\n" "$timestamp" "$__KUBEDOOP_LOG_PREFIX" "$level" "$*"
+    # Sanitize: strip control characters to prevent log injection
+    local msg
+    msg=$(printf '%s' "$*" | tr -d '[:cntrl:]')
+    printf "[%s] [%s] [%s] %s\n" "$timestamp" "$__KUBEDOOP_LOG_PREFIX" "$level" "$msg"
 }
 
 log_info()  { _kubedoop_log "INFO"  "$@"; }
 log_warn()  { _kubedoop_log "WARN"  "$@" >&2; }
 log_error() { _kubedoop_log "ERROR" "$@" >&2; }
-log_debug() { [[ "${KUBEDOOP_DEBUG:-false}" == "true" ]] && _kubedoop_log "DEBUG" "$@"; }
+log_debug() {
+    if [[ "${KUBEDOOP_DEBUG:-false}" == "true" ]]; then
+        _kubedoop_log "DEBUG" "$@"
+    fi
+}
 ```
 
 ### lib/run-phase.sh — Script Discovery and Execution Engine
@@ -138,7 +154,10 @@ discover_scripts() {
     # Note: -executable is GNU find specific (not BSD/macOS). Acceptable here since
     # the target environment is ubi9-minimal (Linux, GNU findutils).
     # With ConfigMap defaultMode: 0755, this correctly matches all executable scripts.
+    # SECURITY: Only execute scripts owned by root (uid 0) to prevent injection
+    # from non-root writable volumes (emptyDir, PVC, hostPath).
     find "$phase_dir" -maxdepth 1 -type f -name '*.sh' -executable \
+        -uid 0 \
         | sort
 }
 
@@ -187,8 +206,14 @@ run_phase() {
 #!/bin/bash
 # /kubedoop/lib/signal.sh — Process lifecycle management
 #
-# Provides graceful process termination with configurable timeout.
-# SIGTERM → wait → SIGKILL escalation pattern.
+# Provides graceful process termination, cleanup orchestration,
+# and full lifecycle management for the universal entrypoint.
+#
+# Depends on: lib/log.sh, lib/run-phase.sh (loaded via glob in entrypoint)
+#
+# Required global variables (set by entrypoint before calling run_lifecycle):
+#   KUBEDOOP_KILL_TIMEOUT - Max seconds to wait before SIGKILL (readonly)
+#   KUBEDOOP_MOUNT_DIR    - Path to mount directory (readonly)
 
 # Terminate a process gracefully with timeout escalation.
 #
@@ -243,6 +268,88 @@ stop_process() {
     # Reap process to capture exit code
     wait "$pid" 2>/dev/null || STOP_EXIT_CODE=$?
     STOP_REAPED=1
+}
+
+# Graceful shutdown handler. Invoked via SIGTERM/SIGINT trap by run_lifecycle.
+#
+# Steps:
+#   1. Guard against re-entrant execution
+#   2. Disarm signal traps to prevent nested handler execution
+#   3. Stop main process (SIGTERM → wait → SIGKILL escalation)
+#   4. Capture actual exit code from reap
+#   5. Run post-script phase hooks
+cleanup() {
+    # Prevent re-entrant execution (trap + fallthrough race)
+    if [[ "${_CLEANUP_RUNNING}" -eq 1 ]]; then
+        return 0
+    fi
+    _CLEANUP_RUNNING=1
+
+    # Disarm signal traps during cleanup to prevent nested handler execution
+    trap - SIGTERM SIGINT
+
+    log_info "Starting shutdown cleanup"
+
+    # Signal to sidecars: main container is stopping
+    if [[ -n "$MAIN_PID" ]] && kill -0 "$MAIN_PID" 2>/dev/null; then
+        write_state "stopping"
+    fi
+
+    stop_process "$MAIN_PID" "$KUBEDOOP_KILL_TIMEOUT"
+
+    # Capture real exit code if process was reaped during signal path
+    if [[ "$STOP_REAPED" -eq 1 && -n "$STOP_EXIT_CODE" ]]; then
+        EXIT_CODE="$STOP_EXIT_CODE"
+    fi
+
+    log_info "Main process stopped"
+
+    # Signal to sidecars: main container has stopped
+    write_state "stopped"
+
+    # Phase: Runtime post-script hooks (auto-discovered from mount)
+    run_phase "post-script" "${KUBEDOOP_MOUNT_DIR}/post-script" || true
+
+    log_info "Shutdown complete"
+}
+
+# Start main process and manage its full lifecycle.
+#
+# This is the core lifecycle function that:
+#   - Blocks signals during process start (prevents empty PID race)
+#   - Backgrounds the command and captures PID
+#   - Restores signal handler immediately after PID capture (minimizes race window)
+#   - Waits for process exit (normal or signal-triggered)
+#   - Runs cleanup on exit
+#
+# Sets EXIT_CODE global to the process exit code on return.
+#
+# Arguments:
+#   $@ - Command and arguments to run as the main process
+run_lifecycle() {
+    MAIN_PID=""
+    EXIT_CODE=0
+    _CLEANUP_RUNNING=0
+
+    # Block signals during process start to prevent cleanup() with empty MAIN_PID
+    trap '' SIGTERM SIGINT
+
+    # Start process and capture PID atomically (same logical line as backgrounding)
+    "$@" & MAIN_PID=$!
+    write_pid "$MAIN_PID"
+    write_state "running"
+
+    # Restore signal handler immediately after PID capture — minimizes race window
+    trap cleanup SIGTERM SIGINT
+
+    log_info "Main process started (PID: $MAIN_PID): $*"
+
+    # Wait for main process to exit
+    wait $MAIN_PID || EXIT_CODE=$?
+    write_exit_code "$EXIT_CODE"
+
+    # Run cleanup (if not already triggered by signal trap)
+    cleanup
 }
 ```
 
@@ -350,16 +457,30 @@ wait_for_state() {
 # Note: Uses set -uo pipefail WITHOUT -e.
 # Signal-aware scripts must not use set -e because trap handlers
 # and set -e interact unpredictably. All error handling is explicit.
+#
+# Lifecycle logic (cleanup, signal handling) is in lib/signal.sh.
+# This script is a thin orchestrator: config → load → pre-script → lifecycle → exit.
 set -uo pipefail
 
-export KUBEDOOP_HOME="${KUBEDOOP_HOME:-/kubedoop}"
-export KUBEDOOP_MOUNT_DIR="${KUBEDOOP_MOUNT_DIR:-${KUBEDOOP_HOME}/mount}"
-export KUBEDOOP_RUN_DIR="${KUBEDOOP_RUN_DIR:-${KUBEDOOP_HOME}/run}"
+# Paths are locked at build time — not overridable via environment variables
+readonly KUBEDOOP_HOME="/kubedoop"
+readonly KUBEDOOP_MOUNT_DIR="${KUBEDOOP_HOME}/mount"
+readonly KUBEDOOP_RUN_DIR="${KUBEDOOP_HOME}/run"
+
+# Graceful shutdown timeout (seconds). Validated and locked at startup.
+KUBEDOOP_KILL_TIMEOUT="${KUBEDOOP_KILL_TIMEOUT:-30}"
+if ! [[ "$KUBEDOOP_KILL_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[kubedoop] [ERROR] KUBEDOOP_KILL_TIMEOUT must be a positive integer >= 1, got: $KUBEDOOP_KILL_TIMEOUT" >&2
+    exit 1
+fi
+readonly KUBEDOOP_KILL_TIMEOUT
 
 # Ensure run directory exists with correct permissions
 mkdir -p "${KUBEDOOP_RUN_DIR}"
 
-# Load common libraries
+# Load common libraries.
+# Libraries load in glob sort order. If a library depends on another,
+# it must document this requirement (e.g., signal.sh depends on log.sh and run-phase.sh).
 for lib in "${KUBEDOOP_HOME}/lib/"*.sh; do
     if [[ -f "$lib" ]]; then
         # shellcheck source=/dev/null
@@ -377,77 +498,16 @@ if ! run_phase "pre-script" "${KUBEDOOP_MOUNT_DIR}/pre-script"; then
     exit 1
 fi
 
-# --- Clean stale state and register signal handler ---
-MAIN_PID=""
-EXIT_CODE=0
-_CLEANUP_RUNNING=0
-
-cleanup() {
-    # Prevent re-entrant execution (trap + fallthrough race)
-    if [[ "${_CLEANUP_RUNNING}" -eq 1 ]]; then
-        return 0
-    fi
-    _CLEANUP_RUNNING=1
-
-    # Disarm signal traps during cleanup to prevent nested handler execution
-    trap - SIGTERM SIGINT
-
-    log_info "Starting shutdown cleanup"
-
-    # Only write "stopping" if main process is still alive (signal-triggered shutdown)
-    if [[ -n "$MAIN_PID" ]] && kill -0 "$MAIN_PID" 2>/dev/null; then
-        write_state "stopping"
-    fi
-
-    stop_process "$MAIN_PID" "${KUBEDOOP_KILL_TIMEOUT:-30}"
-
-    # Capture real exit code if process was reaped during signal path
-    if [[ "$STOP_REAPED" -eq 1 && -n "$STOP_EXIT_CODE" ]]; then
-        EXIT_CODE="$STOP_EXIT_CODE"
-    fi
-
-    # Notify sidecars: main container has stopped
-    write_state "stopped"
-
-    # Phase 2: Runtime post-script hooks (auto-discovered from mount)
-    run_phase "post-script" "${KUBEDOOP_MOUNT_DIR}/post-script" || true
-
-    log_info "Shutdown complete"
-}
-
-# Register trap BEFORE starting the process to close the SIGTERM race window.
-# Block signals during process start to prevent cleanup() from firing with empty MAIN_PID.
-trap '' SIGTERM SIGINT
-
 # --- Clean stale state files ---
-# Runs AFTER pre-scripts but BEFORE the main process starts.
-# This ensures any state files written by pre-scripts or previous runs
-# are cleaned before the entrypoint writes authoritative state.
 rm -f "${KUBEDOOP_RUN_DIR}"/main.{pid,status,exit_code}
 
-# --- Start main process ---
+# --- Phase 2: Start main process and manage lifecycle ---
 if [[ $# -eq 0 ]]; then
     log_error "No command specified"
     exit 1
 fi
 
-# Start process and capture PID atomically (same logical line as backgrounding)
-"$@" & MAIN_PID=$!
-write_pid "$MAIN_PID"
-write_state "running"
-
-# Restore signal handler immediately after PID capture — minimizes race window
-trap cleanup SIGTERM SIGINT
-
-log_info "Main process started (PID: $MAIN_PID): $*"
-
-# Wait for main process to exit
-wait $MAIN_PID || EXIT_CODE=$?
-write_exit_code "$EXIT_CODE"
-
-# Run cleanup (if not already triggered by signal trap)
-cleanup
-
+run_lifecycle "$@"
 exit $EXIT_CODE
 ```
 
@@ -456,12 +516,22 @@ exit $EXIT_CODE
 ```dockerfile
 # Append to existing kubedoop-base Dockerfile
 
-# Install init system (e.g., tini, dumb-init — to be decided)
-# Note: RUN <<EOF heredoc syntax requires BuildKit or Docker 20.10+
+# Install init system
+# tini: lightweight init, signal forwarding to direct child, zombie reaping
+# Not available in UBI 9 repos — download static binary from GitHub releases
+# SHA256 checksums are hardcoded in the verification step to prevent --build-arg override
+ARG TARGETARCH
+ADD https://github.com/krallin/tini/releases/download/v0.19.0/tini-static-${TARGETARCH} /tmp/tini
 RUN <<EOF
-    microdnf install tini
-    microdnf clean all
-    rm -rf /var/cache/yum
+    set -e
+    case "${TARGETARCH}" in
+        arm64)  expected_sha="eae1d3aa50c48fb23b8cbdf4e369d0910dfc538566bfd09df89a774aa84a48b9" ;;
+        amd64)  expected_sha="c5b0666b4cb676901f90dfcb37106783c5fe2077b04590973b885950611b30ee" ;;
+        *)      echo "Unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;;
+    esac
+    echo "${expected_sha}  /tmp/tini" | sha256sum -c
+    mv /tmp/tini /usr/bin/tini
+    chmod +x /usr/bin/tini
 EOF
 
 # Deploy universal entrypoint framework
@@ -471,28 +541,20 @@ COPY --chown=root:root kubedoop/bin/entrypoint.sh /kubedoop/bin/entrypoint.sh
 RUN chmod -R 0755 /kubedoop/lib/ /kubedoop/bin/ \
     && mkdir -p /kubedoop/mount/{pre-script,post-script} \
     && chown -R root:root /kubedoop/mount/ \
-    && chmod -R 0755 /kubedoop/mount/
-
-# State directory: the ONLY writable path for kubedoop user
-RUN mkdir -p /kubedoop/run \
+    && mkdir -p /kubedoop/run \
     && chown kubedoop:kubedoop /kubedoop/run \
     && chmod 1775 /kubedoop/run
 
-# Security: run as non-root user
+# Security requirements for derived images and pods:
+# - runAsNonRoot: true (or runAsUser: 1001)
+# - readOnlyRootFilesystem: true (with /kubedoop/run as emptyDir)
+# - allowPrivilegeEscalation: false
+# - Runtime script injection: only ConfigMap/projected volumes in /kubedoop/mount/
 USER 1001
 
 # Init process as PID 1
-# No -g flag: init forwards signals only to direct child process.
-# The entrypoint.sh manages signal propagation explicitly via trap.
-#
-# IMPORTANT: tini and dumb-init have different default signal behaviors:
-#   tini:      Forwards signals to direct child only (no -g).
-#   dumb-init: Uses process groups by default (effectively -g).
-# If switching from tini to dumb-init, use --single-child flag to match
-# the signal semantics assumed by this design, or update the trap logic.
-#
-# tini:      ENTRYPOINT ["tini", "--", "/kubedoop/bin/entrypoint.sh"]
-# dumb-init: ENTRYPOINT ["dumb-init", "--single-child", "--", "/kubedoop/bin/entrypoint.sh"]
+# No -g flag: tini forwards signals only to direct child process.
+# The entrypoint.sh manages signal propagation explicitly via lib/signal.sh.
 ENTRYPOINT ["tini", "--", "/kubedoop/bin/entrypoint.sh"]
 ```
 

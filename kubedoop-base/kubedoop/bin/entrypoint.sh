@@ -4,6 +4,9 @@
 # Note: Uses set -uo pipefail WITHOUT -e.
 # Signal-aware scripts must not use set -e because trap handlers
 # and set -e interact unpredictably. All error handling is explicit.
+#
+# Lifecycle logic (cleanup, signal handling) is in lib/signal.sh.
+# This script is a thin orchestrator: config → load → pre-script → lifecycle → exit.
 set -uo pipefail
 
 # Paths are locked at build time — not overridable via environment variables
@@ -23,9 +26,8 @@ readonly KUBEDOOP_KILL_TIMEOUT
 mkdir -p "${KUBEDOOP_RUN_DIR}"
 
 # Load common libraries.
-# Note: Libraries load in glob sort order. If a library depends on another,
-# it must document this requirement (e.g., run-phase.sh depends on log.sh,
-# signal.sh depends on log.sh).
+# Libraries load in glob sort order. If a library depends on another,
+# it must document this requirement (e.g., signal.sh depends on log.sh and run-phase.sh).
 for lib in "${KUBEDOOP_HOME}/lib/"*.sh; do
     if [[ -f "$lib" ]]; then
         # shellcheck source=/dev/null
@@ -43,78 +45,11 @@ if ! run_phase "pre-script" "${KUBEDOOP_MOUNT_DIR}/pre-script"; then
     exit 1
 fi
 
-# --- Register signal handler ---
-MAIN_PID=""
-EXIT_CODE=0
-_CLEANUP_RUNNING=0
-
-# Graceful shutdown handler. Invoked via SIGTERM/SIGINT trap.
-#
-# Steps:
-#   1. Guard against re-entrant execution (trap + fallthrough race)
-#   2. Disarm signal traps to prevent nested handler execution
-#   3. Stop main process (SIGTERM → wait → SIGKILL escalation via stop_process)
-#   4. Capture actual exit code from reap
-#   5. Run post-script phase hooks
-#
-# Environment:
-#   MAIN_PID              - PID of the main process (set by caller)
-#   KUBEDOOP_KILL_TIMEOUT - Max seconds to wait before SIGKILL (readonly)
-#
-# Returns:
-#   0 - Always (best-effort cleanup, errors are logged but not propagated)
-cleanup() {
-    # Prevent re-entrant execution (trap + fallthrough race)
-    if [[ "${_CLEANUP_RUNNING}" -eq 1 ]]; then
-        return 0
-    fi
-    _CLEANUP_RUNNING=1
-
-    # Disarm signal traps during cleanup to prevent nested handler execution
-    trap - SIGTERM SIGINT
-
-    log_info "Starting shutdown cleanup"
-
-    stop_process "$MAIN_PID" "$KUBEDOOP_KILL_TIMEOUT"
-
-    # Capture real exit code if process was reaped during signal path
-    if [[ "$STOP_REAPED" -eq 1 && -n "$STOP_EXIT_CODE" ]]; then
-        EXIT_CODE="$STOP_EXIT_CODE"
-    fi
-
-    log_info "Main process stopped"
-
-    # Phase 2: Runtime post-script hooks (auto-discovered from mount)
-    run_phase "post-script" "${KUBEDOOP_MOUNT_DIR}/post-script" || true
-
-    log_info "Shutdown complete"
-}
-
-# Block signals during process start to prevent cleanup() from firing with empty MAIN_PID.
-# There is a small race window between "$@" & MAIN_PID=$! and the trap re-arm below
-# where SIGTERM is still ignored. If SIGTERM arrives during this window, the main process
-# continues running and will only be terminated when K8s escalates to SIGKILL after
-# terminationGracePeriodSeconds. tini provides the safety net (reaps orphans on exit).
-trap '' SIGTERM SIGINT
-
-# --- Start main process ---
+# --- Phase 2: Start main process and manage lifecycle ---
 if [[ $# -eq 0 ]]; then
     log_error "No command specified"
     exit 1
 fi
 
-# Start process and capture PID atomically (same logical line as backgrounding)
-"$@" & MAIN_PID=$!
-
-# Restore signal handler immediately after PID capture — minimizes race window
-trap cleanup SIGTERM SIGINT
-
-log_info "Main process started (PID: $MAIN_PID): $*"
-
-# Wait for main process to exit
-wait $MAIN_PID || EXIT_CODE=$?
-
-# Run cleanup (if not already triggered by signal trap)
-cleanup
-
+run_lifecycle "$@"
 exit $EXIT_CODE
