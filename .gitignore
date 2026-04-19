@@ -64,6 +64,7 @@ downloads/
 eggs/
 .eggs/
 lib/
+!kubedoop-base/kubedoop/lib/
 lib64/
 parts/
 sdist/
