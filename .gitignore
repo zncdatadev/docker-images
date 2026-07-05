@@ -247,6 +247,7 @@ go.work
 .idea/**/aws.xml
 
 # Generated files
+bin/
 .idea/**/contentModel.xml
 
 # Sensitive or high-churn files

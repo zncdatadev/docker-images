@@ -73,7 +73,7 @@ RUN <<EOF
     curl -sSfL -o /usr/local/bin/log4shell \
         https://github.com/lunasec-io/lunasec/releases/download/v1.6.1-log4shell/log4shell_1.6.1-log4shell_Linux_${ARCH}
     chmod +x /usr/local/bin/log4shell
-    /usr/local/bin/log4shell patch --backup --force-patch --json hadoop-${PRODUCT_VERSION}
+    /usr/local/bin/log4shell patch --backup --force-patch --json /kubedoop/zookeeper
 EOF
 
 

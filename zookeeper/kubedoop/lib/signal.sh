@@ -54,22 +54,31 @@ stop_process() {
     log_info "Forwarding SIGTERM to main process (PID: $pid)"
     kill -TERM "$pid" 2>/dev/null || true
 
-    # Wait for process to exit (with timeout protection)
-    local elapsed=0
-    while kill -0 "$pid" 2>/dev/null && [[ $elapsed -lt $timeout ]]; do
-        sleep 1
-        elapsed=$((elapsed + 1))
-    done
+    # Reap process to capture exit code. Use a SIGALRM timer for timeout
+    # protection instead of polling with kill -0: a dead-but-unreaped child is
+    # still visible to kill -0 as a zombie, which can add a full timeout delay
+    # even after graceful shutdown has completed.
+    local timed_out=0
+    local shell_pid="$BASHPID"
+    (
+        sleep "$timeout"
+        kill -ALRM "$shell_pid" 2>/dev/null
+    ) &
+    local timer_pid=$!
 
-    # Force kill on timeout
-    if kill -0 "$pid" 2>/dev/null; then
-        log_warn "Main process did not exit in ${timeout}s, sending SIGKILL"
-        kill -KILL "$pid" 2>/dev/null || true
-    fi
+    trap 'timed_out=1; log_warn "Main process did not exit in ${timeout}s, sending SIGKILL"; kill -KILL "$pid" 2>/dev/null || true' SIGALRM
 
-    # Reap process to capture exit code
     wait "$pid" 2>/dev/null
     local rc=$?
+    if [[ "$timed_out" -eq 1 ]]; then
+        wait "$pid" 2>/dev/null
+        rc=$?
+    fi
+
+    trap - SIGALRM
+    kill "$timer_pid" 2>/dev/null || true
+    wait "$timer_pid" 2>/dev/null || true
+
     if [[ $rc -eq 127 ]]; then
         # Not a child of this shell — already reaped, exit code unknown
         STOP_REAPED=0
