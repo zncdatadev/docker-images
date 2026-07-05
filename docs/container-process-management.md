@@ -1,6 +1,6 @@
 # Container Process Management Design
 
-> **Status**: Phase 1 (kubedoop-base) implemented. Init system: tini v0.19.0. Pod state and sidecar watchdog deferred.
+> **Status**: Piloting in the **zookeeper** image (product-first rollout, see [Rollout Strategy](#rollout-strategy-product-first)). Init system: tini v0.19.0. Extraction into `kubedoop-base`, pod-state coordination, and the sidecar watchdog are deferred.
 
 ## Design Goals
 
@@ -76,9 +76,9 @@ Kubernetes sends SIGTERM
 |  |  [1] source lib/*.sh                Load libraries      | |
 |  |  [2] run_phase mount/pre-script     Runtime pre-hooks   | |
 |  |  [3] run_lifecycle "$@"             Start + manage      | |
-|  |      ├── trap '' SIGTERM SIGINT     Block signals       | |
+|  |      ├── trap 'defer' SIGTERM SIGINT Defer (not SIG_IGN)| |
 |  |      ├── "$@" & MAIN_PID=$!         Background CMD      | |
-|  |      ├── trap cleanup SIGTERM SIGINT Restore handler    | |
+|  |      ├── trap cleanup SIGTERM SIGINT Arm real handler   | |
 |  |      └── wait $MAIN_PID             Wait for exit       | |
 |  |                                                         | |
 |  |  -- On SIGTERM received (via cleanup) --                 | |
@@ -345,25 +345,54 @@ run_lifecycle() {
     MAIN_PID=""
     EXIT_CODE=0
     _CLEANUP_RUNNING=0
+    _PENDING_SIGNAL=0
 
-    # Block signals during process start to prevent cleanup() with empty MAIN_PID
-    trap '' SIGTERM SIGINT
+    # Defer signals during process start to close the race where SIGTERM arrives
+    # before MAIN_PID is captured (which would run cleanup() with an empty PID).
+    #
+    # CRITICAL: use a real handler that records a pending flag — NOT `trap ''`.
+    # `trap '' SIGTERM` installs SIG_IGN, which is INHERITED by the backgrounded
+    # child across fork/exec. A non-interactive child shell cannot re-trap a
+    # signal that was ignored on entry, so the child (and any SIGTERM handler it
+    # installs, e.g. a product entrypoint) would silently ignore graceful
+    # shutdown — the exact opposite of this framework's guarantee. A real trap
+    # handler is reset to SIG_DFL in the execed child, so the child receives
+    # SIGTERM normally and may install its own handler.
+    trap '_PENDING_SIGNAL=1' SIGTERM SIGINT
 
     # Start process and capture PID atomically (same logical line as backgrounding)
     "$@" & MAIN_PID=$!
 
-    # Restore signal handler immediately after PID capture — minimizes race window
+    # Swap the deferring handler for the real cleanup handler.
     trap cleanup SIGTERM SIGINT
 
     log_info "Main process started (PID: $MAIN_PID): $*"
 
-    # Wait for main process to exit
-    wait $MAIN_PID || EXIT_CODE=$?
-
-    # Run cleanup (if not already triggered by signal trap)
-    if [[ "${_CLEANUP_RUNNING:-0}" -ne 1 ]]; then
+    # If a signal arrived during the start window, the deferring handler recorded
+    # it. Run cleanup now (with a valid MAIN_PID) instead of waiting.
+    if [[ "$_PENDING_SIGNAL" -eq 1 ]]; then
+        log_info "Signal received during startup, initiating shutdown"
         cleanup
     fi
+
+    # Wait for the main process to exit.
+    #
+    # Two paths reach this point:
+    #   Normal exit — main process exits on its own; wait returns its real code.
+    #   Signal path — SIGTERM/SIGINT arrives during wait, firing the cleanup()
+    #                 trap. cleanup() reaps the child and sets EXIT_CODE to the
+    #                 real reaped code. The interrupted wait then returns
+    #                 128+signum (e.g. 143 for SIGTERM), which must NOT clobber
+    #                 the real exit code cleanup() already captured.
+    local rc=0
+    wait "$MAIN_PID" || rc=$?
+
+    if [[ "${_CLEANUP_RUNNING:-0}" -ne 1 ]]; then
+        # Normal exit path: capture the real exit code, then run cleanup hooks.
+        EXIT_CODE=$rc
+        cleanup
+    fi
+    # Signal path: cleanup() already ran and set EXIT_CODE — leave it intact.
 }
 ```
 
@@ -929,7 +958,34 @@ spec:
 
 For K8s >= 1.28, the native sidecar handles start/stop ordering. State files provide early flush triggering (the sidecar starts draining before K8s even sends SIGTERM), which reduces log loss during shutdown. State files also provide visibility (PID, exit code) for debugging.
 
+## Rollout Strategy: Product-First
+
+The end-state design deploys the framework once in `kubedoop-base` so every image
+inherits it (see [kubedoop-base/Dockerfile Integration](#kubedoop-basedockerfile-integration)).
+However, **any change to `kubedoop-base` rebuilds every downstream image** in the PR
+pipeline, which is prohibitively slow while the framework itself is still being iterated on.
+
+To avoid that, the framework is rolled out **product-first**:
+
+1. **Pilot in a single product image** — the framework source (`lib/`, `bin/entrypoint.sh`)
+   is vendored under the product directory (e.g. `zookeeper/kubedoop/{lib,bin}`), and the
+   tini install + framework deploy steps live in that product's `Dockerfile`. Only that one
+   image rebuilds. **zookeeper** is the first pilot (a simple, zero-script product).
+2. **Repeat for a few more products** to validate the contract across shapes (zero-script,
+   product-entrypoint, complex-entrypoint).
+3. **Extract upward into `kubedoop-base`** once proven. At that point the per-product
+   `lib/`, `bin/`, and Dockerfile steps are removed in favour of inheritance — this is the
+   original Phase 1 below, executed last instead of first.
+
+The framework contents are identical in both placements; only the *layer* they live in
+changes. This means a product piloting the framework today needs no code changes when the
+extraction lands — its `Dockerfile` simply drops the now-inherited steps.
+
 ## Gradual Migration Path
+
+> **Note**: Under the [product-first rollout](#rollout-strategy-product-first), Phase 1 is
+> executed **last** (extraction into `kubedoop-base`), after the framework has been piloted
+> in individual product images. The phases below describe the end-state layering.
 
 ### Phase 1: Infrastructure
 
@@ -1031,7 +1087,7 @@ The security model protects the **container image** (framework + application), n
 
 **What is NOT protected**: Writable paths explicitly mounted by the operator (log directories, PVC data, hostPath mounts). This is by design — the operator controls the trust boundary.
 
-**State file protection**: The entrypoint cleans stale/fake state files after pre-scripts run but before the main process starts (see `rm -f` in entrypoint.sh). This prevents injected pre-scripts from poisoning sidecar coordination with fake `main.status` or `main.pid` values. Pre-scripts are trusted not to write state files between the cleanup and the real state writes (a sub-millisecond window).
+**State file protection** (deferred, ships with pod-state coordination): once state files are written, the entrypoint will clean stale/fake state files after pre-scripts run but before the main process starts (a `rm -f` step in entrypoint.sh). This prevents injected pre-scripts from poisoning sidecar coordination with fake `main.status` or `main.pid` values. Pre-scripts are trusted not to write state files between the cleanup and the real state writes (a sub-millisecond window). Until `lib/pod-state.sh` is deployed, no state files are written and this cleanup is not present.
 
 ## Architecture Relationship
 
