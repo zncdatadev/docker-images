@@ -64,6 +64,9 @@ downloads/
 eggs/
 .eggs/
 lib/
+# Framework libraries vendored per product image (product-first rollout).
+# The generic `lib/` rule above (Python build artifacts) would otherwise ignore them.
+!zookeeper/kubedoop/lib/
 lib64/
 parts/
 sdist/
@@ -244,6 +247,7 @@ go.work
 .idea/**/aws.xml
 
 # Generated files
+bin/
 .idea/**/contentModel.xml
 
 # Sensitive or high-churn files

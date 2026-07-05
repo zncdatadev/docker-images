@@ -26,6 +26,10 @@ See `versions.yaml` for current values. Structure:
 - `kubedoop/jmx/config/config.yaml` — ZooKeeper-specific rules: ReplicatedServer patterns (with replicaId label), standalone patterns, InMemoryDataTree pattern (with memberType label)
 ### Custom Scripts
 - `kubedoop/patches/apply_patches.sh` — applies .patch files from version subdirectories
+- `kubedoop/bin/entrypoint.sh` — universal entrypoint framework pilot for process lifecycle management
+- `kubedoop/lib/` — entrypoint framework libraries for logging, hook discovery, and signal handling
+- `tests/source-entrypoint-framework.sh` — source-level shell tests for the vendored entrypoint framework
+- `tests/image-entrypoint-framework.sh` — image-level tests for built entrypoint behavior
 
 ## Dependencies
 - Uses at build time: java-devel (Java 11)
@@ -34,6 +38,10 @@ See `versions.yaml` for current values. Structure:
 
 ## Key Files
 - `Dockerfile` — simplest Java build: single Maven stage with `-Pfull-build`, excludes zookeeper-client-c, log4shell patch, tarball rename (-bin suffix)
+- `kubedoop/bin/entrypoint.sh` — universal entrypoint wrapper used as the image entrypoint via tini
+- `kubedoop/lib/` — vendored framework libraries for the product-first rollout
+- `tests/source-entrypoint-framework.sh` — local source-level verification for framework lifecycle behavior
+- `tests/image-entrypoint-framework.sh` — post-build image verification for entrypoint wiring, hooks, and signal behavior
 - `kubedoop/patches/3.9.2/` — version-specific patches
 - `kubedoop/patches/apply_patches.sh` — patch application script
 - `kubedoop/jmx/config/config.yaml` — ZooKeeper JMX rules

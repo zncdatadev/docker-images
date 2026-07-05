@@ -22,7 +22,7 @@ ifeq (,$(shell which yq 2>/dev/null))
 		OS=$(shell uname -s | tr '[:upper:]' '[:lower:]') && \
 		ARCH=$(shell uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/') && \
 		if [ "$${OS}" = "darwin" ]; then OS="macos"; fi && \
-		curl -sSLo $(YQ) https://github.com/mikefarah/yq/releases/latest/download/ya_$${OS}_$${ARCH} ;\
+		curl -sSLo $(YQ) https://github.com/mikefarah/yq/releases/latest/download/yq_$${OS}_$${ARCH} ;\
 		chmod +x $(YQ) ;\
 	}
 else
