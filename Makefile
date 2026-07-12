@@ -21,8 +21,7 @@ ifeq (,$(shell which yq 2>/dev/null))
 		mkdir -p $(dir $(YQ)) ;\
 		OS=$(shell uname -s | tr '[:upper:]' '[:lower:]') && \
 		ARCH=$(shell uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/') && \
-		if [ "$${OS}" = "darwin" ]; then OS="macos"; fi && \
-		curl -sSLo $(YQ) https://github.com/mikefarah/yq/releases/latest/download/ya_$${OS}_$${ARCH} ;\
+		curl -sSLo $(YQ) https://github.com/mikefarah/yq/releases/latest/download/yq_$${OS}_$${ARCH} ;\
 		chmod +x $(YQ) ;\
 	}
 else
@@ -60,8 +59,7 @@ ifeq (,$(shell which cosign 2>/dev/null))
 		mkdir -p $(dir $(COSIGN)) ;\
 		OS=$(shell uname -s | tr '[:upper:]' '[:lower:]') && \
 		ARCH=$(shell uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/') && \
-		if [ "$${OS}" = "darwin" ]; then OS="macos"; fi && \
-		curl -sSLo $(COSIGN) https://github.com/sigstore/cosign/releases/latest/download/cosign-$$OS-$${ARCH} ;\
+		curl -sSLo $(COSIGN) https://github.com/sigstore/cosign/releases/latest/download/cosign-$${OS}-$${ARCH} ;\
 		chmod +x $(COSIGN) ;\
 	}
 else
@@ -199,11 +197,11 @@ kafka-buildx: jq ## Build Kafka image with buildx
 
 .PHONY:
 spark-build: jq ## Build Spark image
-	.scripts/build.sh spark
+	.scripts/build.sh spark-k8s
 
 .PHONY:
 spark-buildx: jq ## Build Spark image with buildx
-	.scripts/build.sh spark --push
+	.scripts/build.sh spark-k8s --push
 
 .PHONY:
 superset-build: jq ## Build Superset image
