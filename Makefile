@@ -87,6 +87,14 @@ vector-build: ## Build Vector image
 vector-buildx: jq ## Build Vector image with buildx
 	.scripts/build.sh vector --push
 
+.PHONY:
+helloworld-build: jq ## Build helloworld image
+	.scripts/build.sh helloworld
+
+.PHONY:
+helloworld-buildx: jq ## Build helloworld image with buildx
+	.scripts/build.sh helloworld --push
+
 ##@ develop environment
 
 .PHONY:
