@@ -6,6 +6,7 @@ versions:
     jmx-exporter: 1.3.0
     async-profiler: 2.9
     oauth2-proxy: 7.12.0
+    tini: 0.19.0
   - product: 3.3.6
     java-base: 11
     java-devel: 11
@@ -13,3 +14,4 @@ versions:
     jmx-exporter: 1.3.0
     async-profiler: 2.9
     oauth2-proxy: 7.12.0
+    tini: 0.19.0

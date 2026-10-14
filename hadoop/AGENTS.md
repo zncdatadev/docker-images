@@ -2,11 +2,12 @@
 <!-- Parent: ../AGENTS.md -->
 
 ## Overview
-Apache Hadoop distributed storage and processing. Most complex Java build in the repo -- compiles protobuf from source and builds Hadoop with native code support including fuse_dfs.
+HDFS-focused Apache Hadoop distribution. The existing Maven build excludes YARN and MapReduce distribution modules; shipped commands are hadoop, hdfs and fuse_dfs. Compiles protobuf from source and builds native code support including fuse_dfs.
 
 ## Build Details
 - Build command: `make hadoop-build`
-- Build stages: single complex build stage (compiles protobuf from source, installs boost via EPEL, builds Hadoop from source with `-Pdist,native` profile, produces fuse_dfs binary)
+- Build stages: complex source/native builder (protobuf, boost/EPEL, Hadoop `-Pdist,native`, fuse_dfs), checksum-pinned Tini downloader, final Java runtime
+- Source builder copies only patches into /build/patches; JMX configuration retains its original separate COPY. Runtime entrypoint changes do not invalidate the Hadoop Maven source layer.
 - Build system: Maven
 - Base images: java-devel -> java-base
 
@@ -22,6 +23,7 @@ See `versions.yaml` for current values. Structure:
 | jmx-exporter | JMX exporter version |
 | async-profiler | Async-profiler version |
 | oauth2-proxy | OAuth2 proxy version |
+| tini | Pinned init binary version, with architecture-specific checksums |
 
 ## Kubedoop Customizations
 ### Patches (18 total)
@@ -35,6 +37,9 @@ See `versions.yaml` for current values. Structure:
 
 ### Custom Scripts
 - `kubedoop/patches/apply_patches.sh` -- applies versioned patches during build
+- `kubedoop/bin/entrypoint.sh`, `kubedoop/lib/{log,run,signal}.sh` -- universal foreground lifecycle, root-owned projected hooks, bounded TERM/INT shutdown and exit propagation
+- Default ENTRYPOINT is Tini plus the universal entrypoint; CMD is `hdfs namenode`. No automatic NameNode formatting or native script rewriting occurs.
+- `tests/` -- source/image regressions, four shipped HDFS foreground role paths, real isolated HDFS data/identity persistence and restart/TERM/INT tests. Fixtures are test-only.
 
 ## Extras
 - Includes async-profiler, oauth2-proxy, JMX exporter
