@@ -30,7 +30,16 @@ None -- airflow builds purely from upstream PyPI packages.
 None -- monitoring uses statsd-exporter instead of JMX.
 
 ### Custom Scripts
-- `bin/entrypoint.sh` -- Apache-licensed entrypoint with LD_PRELOAD libstdc++ workaround for issue #17546
+- `kubedoop/bin/entrypoint.sh` and `kubedoop/lib/` -- universal hook lifecycle,
+  protected runtime paths, stdin/status retention and bounded group shutdown.
+- `kubedoop/bin/run-airflow` -- adapted original Apache-licensed startup;
+  project UID/GID 1001 accepted, UBI libstdc++ preload path, venv retained for root,
+  native CLI/optional initialization preserved. Explicit migration is fail-fast.
+  Broker connectivity uses bounded Python TCP (no unavailable netcat dependency).
+- Checksum-pinned Tini 0.19.0 and util-linux setsid; Celery worker gets main-only
+  TERM for warm shutdown before draining remaining group members.
+- ENTRYPOINT prefixes run-airflow; safe default CMD is `airflow --help`.
+- `tests/` -- source framework/native-adapter and final image regressions.
 
 ### Airflow Extras
 Per-version extras defined in `requirements/{version}/airflow-extras.txt` with pinned constraints in `constraints.txt`. Available versions: 2.10.4, 2.10.5, 3.0.1. Version 3.0.1 uses `-` separator in extras names, 2.10.x uses `.` separator. ~23 extras including: async, amazon, celery, cncf-kubernetes, docker, elasticsearch, ldap, trino.
