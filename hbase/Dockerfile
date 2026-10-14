@@ -84,6 +84,7 @@ EOF
 WORKDIR /build
 COPY /kubedoop/patches /build/patches
 RUN <<EOF
+    set -eo pipefail
     mkdir -p /build/hbase-src
     pushd /build/hbase-src
 
@@ -93,7 +94,10 @@ RUN <<EOF
 
     # Download and extract source
     echo "Downloading HBase from: ${SOURCE_URL}"
-    curl -sSfL "${SOURCE_URL}" | tar xzf - --strip-components=1
+    curl -sSfL --retry 3 --retry-all-errors --connect-timeout 20 --max-time 180 "${SOURCE_URL}" -o /tmp/hbase-source.tar.gz
+    gzip -t /tmp/hbase-source.tar.gz
+    tar xzf /tmp/hbase-source.tar.gz --strip-components=1
+    rm /tmp/hbase-source.tar.gz
 
     # Apply patches if exists
     PATCH_DIR="${PATCHES_PATH}/${PATCH_PATH}"
@@ -160,6 +164,7 @@ WORKDIR /build
 COPY /kubedoop/patches /build/patches
 # setup hbase-operator-tools
 RUN <<EOF
+    set -eo pipefail
     mkdir -p /build/hbase-operator-tools-src
     pushd /build/hbase-operator-tools-src
 
@@ -182,7 +187,10 @@ RUN <<EOF
 
     # Download and extract source
     echo "Downloading hbase-operator-tools from: ${SOURCE_URL}"
-    curl -sSfL "${SOURCE_URL}" | tar xzf - --strip-components=1
+    curl -sSfL --retry 3 --retry-all-errors --connect-timeout 20 --max-time 180 "${SOURCE_URL}" -o /tmp/hbase-operator-tools-source.tar.gz
+    gzip -t /tmp/hbase-operator-tools-source.tar.gz
+    tar xzf /tmp/hbase-operator-tools-source.tar.gz --strip-components=1
+    rm /tmp/hbase-operator-tools-source.tar.gz
 
     # Apply patches if exists
     PATCHES_DIR="${PATCHES_PATH}/hbase-operator-tools/${PATCH_PATH}"
@@ -247,6 +255,22 @@ COPY --from=hadoop \
     /kubedoop/hadoop/share/hadoop/tools/lib/
 
 
+## stage: tini-downloader
+FROM zncdatadev/image/java-devel AS tini-downloader
+ARG TARGETARCH
+ARG TINI_VERSION
+RUN <<EOF
+    set -e
+    curl -sSfL -o /tmp/tini "https://github.com/krallin/tini/releases/download/v${TINI_VERSION}/tini-static-${TARGETARCH}"
+    case "${TARGETARCH}" in
+        amd64) expected_sha="c5b0666b4cb676901f90dfcb37106783c5fe2077b04590973b885950611b30ee" ;;
+        arm64) expected_sha="eae1d3aa50c48fb23b8cbdf4e369d0910dfc538566bfd09df89a774aa84a48b9" ;;
+        *) echo "Unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;;
+    esac
+    echo "${expected_sha}  /tmp/tini" | sha256sum -c
+    chmod 0755 /tmp/tini
+EOF
+
 ## stage: final
 FROM zncdatadev/image/java-base
 
@@ -275,6 +299,17 @@ COPY --from=hbase-operator-tools-builder --chown=kubedoop:kubedoop /kubedoop/ /k
 # setup hadoop-s3
 COPY --from=hadoop-s3-builder --chown=kubedoop:kubedoop /kubedoop/ /kubedoop/
 
+COPY --from=tini-downloader /tmp/tini /usr/bin/tini
+COPY --chown=root:root kubedoop/lib/ /kubedoop/lib/
+COPY --chown=root:root kubedoop/bin/entrypoint.sh /kubedoop/bin/entrypoint.sh
+RUN chown root:kubedoop /kubedoop \
+    && chmod 1770 /kubedoop \
+    && chown root:root /kubedoop/bin /kubedoop/lib \
+    && chmod -R 0755 /kubedoop/bin /kubedoop/lib \
+    && mkdir -p /kubedoop/mount/pre-script /kubedoop/mount/post-script /kubedoop/run \
+    && chown -R root:root /kubedoop/mount && chmod -R 0755 /kubedoop/mount \
+    && chown kubedoop:kubedoop /kubedoop/run && chmod 1775 /kubedoop/run
+
 RUN find /kubedoop/hadoop/share/ -name *.jar | grep 'aws' | xargs -I {} ln -s {} /kubedoop/hbase/lib/
 
 ENV HBASE_HOME=/kubedoop/hbase
@@ -287,4 +322,5 @@ WORKDIR /kubedoop/hbase
 
 USER kubedoop
 
+ENTRYPOINT ["tini", "--", "/kubedoop/bin/entrypoint.sh"]
 CMD ["hbase", "master", "start"]
