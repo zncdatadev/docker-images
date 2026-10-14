@@ -1,24 +1,63 @@
 #!/bin/bash
+# /kubedoop/bin/entrypoint.sh -- Universal container entrypoint
+#
+# Note: Uses set -uo pipefail WITHOUT -e.
+# Signal-aware scripts must not use set -e because trap handlers
+# and set -e interact unpredictably. All error handling is explicit.
+#
+# Lifecycle logic (cleanup, signal handling) is in lib/signal.sh.
+# This script is a thin orchestrator: config → load → pre-script → lifecycle → exit.
+set -uo pipefail
 
-set -ex
+# Paths are locked at build time — not overridable via environment variables
+readonly KUBEDOOP_HOME="/kubedoop"
+readonly KUBEDOOP_MOUNT_DIR="${KUBEDOOP_HOME}/mount"
+readonly KUBEDOOP_RUN_DIR="${KUBEDOOP_HOME}/run"
 
-function main() {
-  run_server "$@"
-}
+# Graceful shutdown timeout (seconds). Validated and locked at startup.
+KUBEDOOP_KILL_TIMEOUT="${KUBEDOOP_KILL_TIMEOUT:-30}"
+if ! [[ "$KUBEDOOP_KILL_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[kubedoop] [ERROR] KUBEDOOP_KILL_TIMEOUT must be a positive integer >= 1, got: $KUBEDOOP_KILL_TIMEOUT" >&2
+    exit 1
+fi
+readonly KUBEDOOP_KILL_TIMEOUT
 
-function run_server() {
-  gunicorn \
-    --bind "${SUPERSET_BIND_ADDRESS:-0.0.0.0}:${SUPERSET_PORT:-8088}" \
-    --workers ${SERVER_WORKER_AMOUNT:-1} \
-    --worker-class ${SERVER_WORKER_CLASS:-gthread} \
-    --threads ${SERVER_THREADS_AMOUNT:-20} \
-    --timeout ${GUNICORN_TIMEOUT:-60} \
-    --keep-alive ${GUNICORN_KEEPALIVE:-2} \
-    --max-requests ${WORKER_MAX_REQUESTS:-0} \
-    --max-requests-jitter ${WORKER_MAX_REQUESTS_JITTER:-0} \
-    --limit-request-line ${SERVER_LIMIT_REQUEST_LINE:-0} \
-    --limit-request-field_size ${SERVER_LIMIT_REQUEST_FIELD_SIZE:-0} \
-    "${FLASK_APP}"
-}
+# Ensure run directory exists with correct permissions
+mkdir -p "${KUBEDOOP_RUN_DIR}"
 
-main "$@"
+# Load common libraries.
+# Libraries load in glob sort order. If a library depends on another,
+# it must document this requirement (e.g., signal.sh depends on log.sh and run.sh).
+for lib in "${KUBEDOOP_HOME}/lib/"*.sh; do
+    if [[ -f "$lib" ]]; then
+        # shellcheck source=/dev/null
+        source "$lib"
+    fi
+done
+
+# Arguments may contain credentials; never include them in framework logs.
+log_info "Entrypoint starting"
+
+# --- Step 1: Operator pre-scripts (auto-discovered from mount) ---
+# Note: pre-script failure prevents main process startup (fail-fast).
+# Operators must test injected scripts in non-production environments first.
+if ! run_pre_scripts; then
+    log_error "Pre-scripts failed, aborting startup"
+    exit 1
+fi
+
+# --- Step 2: Start main process and manage lifecycle ---
+if [[ $# -eq 0 ]]; then
+    log_error "No command specified"
+    exit 1
+fi
+
+# Gunicorn/Celery masters own graceful worker/task shutdown. Remaining
+# descendants are drained only after the master exits or the deadline expires.
+KUBEDOOP_SIGNAL_MAIN_ONLY=0
+case "${2:-}" in
+    webserver|gunicorn|worker|celery) KUBEDOOP_SIGNAL_MAIN_ONLY=1 ;;
+esac
+readonly KUBEDOOP_SIGNAL_MAIN_ONLY
+run_lifecycle "$@"
+exit "$EXIT_CODE"
