@@ -1,0 +1,8 @@
+ARG IMAGE
+FROM ${IMAGE}
+USER root
+COPY mock-java.sh /kubedoop/run/mock-jre/bin/java
+RUN chmod 0755 /kubedoop/run/mock-jre/bin/java
+ENV REAL_JAVA_HOME=${JAVA_HOME}
+ENV JAVA_HOME=/kubedoop/run/mock-jre SPARK_DAEMON_MEMORY=256m
+USER kubedoop

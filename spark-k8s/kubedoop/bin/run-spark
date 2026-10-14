@@ -1,0 +1,57 @@
+#!/bin/bash
+# Foreground role selection; native Spark scripts remain unchanged.
+set -euo pipefail
+die() { printf '[kubedoop] [ERROR] %s\n' "$*" >&2; exit 1; }
+require() { [[ -n "${!1:-}" ]] || die "required variable missing: $1"; }
+[[ $# -gt 0 ]] || die 'no Spark command specified'
+case "$1" in
+    master|worker|history)
+        role="$1"; shift
+        case "$role" in
+            master) class=org.apache.spark.deploy.master.Master ;;
+            worker) class=org.apache.spark.deploy.worker.Worker ;;
+            history) class=org.apache.spark.deploy.history.HistoryServer ;;
+        esac
+        exec "$SPARK_HOME/bin/spark-class" "$class" "$@"
+        ;;
+    driver)
+        shift
+        require SPARK_DRIVER_BIND_ADDRESS
+        exec "$SPARK_HOME/bin/spark-submit" \
+            --conf "spark.driver.bindAddress=$SPARK_DRIVER_BIND_ADDRESS" \
+            --conf "spark.executorEnv.SPARK_DRIVER_POD_IP=$SPARK_DRIVER_BIND_ADDRESS" \
+            --deploy-mode client "$@"
+        ;;
+    executor)
+        shift
+        for name in SPARK_EXECUTOR_MEMORY SPARK_DRIVER_URL SPARK_EXECUTOR_ID SPARK_EXECUTOR_CORES SPARK_APPLICATION_ID SPARK_EXECUTOR_POD_IP SPARK_RESOURCE_PROFILE_ID SPARK_EXECUTOR_POD_NAME; do
+            require "$name"
+        done
+        options=()
+        while IFS= read -r name; do
+            [[ "$name" =~ ^SPARK_JAVA_OPT_[0-9]+$ ]] || continue
+            options+=("${!name}")
+        done < <(compgen -A variable SPARK_JAVA_OPT_ | sort -t_ -k4,4n || true)
+        classpath="${SPARK_CLASSPATH:-}:$SPARK_HOME/jars/*"
+        [[ -z "${SPARK_EXTRA_CLASSPATH:-}" ]] || classpath="$classpath:$SPARK_EXTRA_CLASSPATH"
+        if [[ -n "${HADOOP_HOME:-}" && -z "${SPARK_DIST_CLASSPATH:-}" ]]; then
+            SPARK_DIST_CLASSPATH=$("$HADOOP_HOME/bin/hadoop" classpath)
+        fi
+        [[ -z "${HADOOP_CONF_DIR+x}" ]] || classpath="$HADOOP_CONF_DIR:$classpath"
+        if [[ -n "${SPARK_CONF_DIR+x}" ]]; then
+            classpath="$SPARK_CONF_DIR:$classpath"
+        else
+            classpath="$SPARK_HOME/conf:$classpath"
+        fi
+        classpath="$classpath:$PWD"
+        if [[ -n "${JAVA_HOME:-}" ]]; then java="$JAVA_HOME/bin/java"; else java=java; fi
+        exec "$java" "${options[@]}" -Xms"$SPARK_EXECUTOR_MEMORY" -Xmx"$SPARK_EXECUTOR_MEMORY" \
+            -cp "$classpath:${SPARK_DIST_CLASSPATH:-}" \
+            org.apache.spark.scheduler.cluster.k8s.KubernetesExecutorBackend \
+            --driver-url "$SPARK_DRIVER_URL" --executor-id "$SPARK_EXECUTOR_ID" \
+            --cores "$SPARK_EXECUTOR_CORES" --app-id "$SPARK_APPLICATION_ID" \
+            --hostname "$SPARK_EXECUTOR_POD_IP" --resourceProfileId "$SPARK_RESOURCE_PROFILE_ID" \
+            --podName "$SPARK_EXECUTOR_POD_NAME" "$@"
+        ;;
+    *) exec "$@" ;;
+esac
