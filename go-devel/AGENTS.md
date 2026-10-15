@@ -23,3 +23,11 @@ See `versions.yaml` for current values. Structure:
 ## Key Files
 - `Dockerfile` — Go binary install with dev libs and architecture mapping
 - `versions.yaml` — version specifications
+
+## Process Management
+- Preserve root/Bash default, all4 SDK versions and GOROOT/PATH/toolchain.
+- Checksum-pinned Tini0.19.0 with protected private libexec base helpers,
+  foreground group lifecycle, bounded TERM/KILL, hooks and stdin/status retention.
+- Source/root/generic and real offline nonroot Go compilation/lifecycle tests.
+- Airflow path filter omits go-devel: own CI and local validation explicitly
+  build original Airflow3.0.1 with Go1.23.12 and smoke-test git-sync/Airflow CLI.
