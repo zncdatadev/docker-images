@@ -1,0 +1,5 @@
+# Bullseye's official archived repositories. Keep signature verification enabled;
+# only frozen Release expiry checks are disabled for these archive entries.
+deb [check-valid-until=no] https://archive.debian.org/debian bullseye main
+deb [check-valid-until=no] https://archive.debian.org/debian bullseye-updates main
+deb [check-valid-until=no] https://archive.debian.org/debian-security bullseye-security main
