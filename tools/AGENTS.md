@@ -26,3 +26,12 @@ See `versions.yaml` for current values. Structure:
 ## Key Files
 - `Dockerfile` — multi-tool install with smoke tests per tool
 - `versions.yaml` — version specifications
+
+## Process Management
+- Preserve UID1001, original jq/yq/kubectl versions, tool PATH and Bash CMD.
+- Checksum-pinned Tini0.19.0 and root-owned helpers outside the writable tool
+  directory: `/usr/local/libexec/kubedoop-tools/{bin,lib}`.
+- Owned foreground group lifecycle, bounded TERM/KILL, orphan reaping,
+  root-owned hooks and stdin/status/stdout retention with stderr diagnostics.
+- `tests/` covers source/root/generic lifecycle plus actual jq/yq pipelines and
+  offline kubectl client ConfigMap dry-run as kubedoop and root, on native CI.
