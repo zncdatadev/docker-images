@@ -11,7 +11,7 @@ on:
     branches:
       - main
     tags:
-        - '\d+.\d+.\d+*'
+        - '[0-9]+.[0-9]+.[0-9]+*'
     paths:
       - java-base/**
       - kubedoop-base/**
@@ -97,6 +97,28 @@ jobs:
           push: ${{ github.event_name == 'push' }}
           sign: ${{ github.ref_type == 'tag' }}
           action_debug: 'false' # enable debug for the build-and-push action if needed
+
+      - name: Build source JDK8 test compiler
+        uses: ./.github/actions/build-and-push
+        with:
+          registry: ${{ env.REGISTRY }}
+          kubedoop_version: ${{ env.KUBEDOOP_VERSION }}
+          product_name: java-devel
+          product_version: '8'
+          platform: ${{ matrix.platform }}
+          arch_suffix: true
+          push: 'false'
+          sign: 'false'
+
+      - name: Run JVM lifecycle and inheritance regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="${REGISTRY}/${PRODUCT_NAME}:${{ matrix.version }}-kubedoop${KUBEDOOP_VERSION}-${{ matrix.arch }}"
+          sdk="${REGISTRY}/java-devel:8-kubedoop${KUBEDOOP_VERSION}-${{ matrix.arch }}"
+          bash java-base/tests/source-entrypoint-framework.sh
+          bash java-base/tests/image-entrypoint-framework.sh "$image"
+          bash java-base/tests/image-java-lifecycle.sh "$image" '${{ matrix.version }}' "$sdk"
 
 
   build-manifest:
