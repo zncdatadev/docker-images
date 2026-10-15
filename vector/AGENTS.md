@@ -25,3 +25,16 @@ See `versions.yaml` for current values. Structure:
 ## Key Files
 - `Dockerfile` — multi-stage build: RPM install + inotify-tools source compilation + gomplate binary
 - `versions.yaml` — version specifications
+
+## Process Management
+- Preserve inherited root USER and /bin/bash CMD; no automatic log collection.
+- Checksum-pinned Tini0.19.0, setsid foreground group, universal root-owned hooks,
+  stderr diagnostics, stdin/status retention and bounded shutdown.
+- Base-only helpers: `/usr/local/libexec/kubedoop-vector/{bin,lib}`. Never use
+  `/kubedoop/bin/entrypoint.sh` for the inherited base supervisor: child products
+  replace that path. Child ENTRYPOINT overrides work normally.
+- HOME remains writable/sticky for UID1001, protected helper paths are outside
+  application COPY/chown trees. Inotify source builds fail fast on errors.
+- `tests/` covers generic lifecycle, real Vector VRL/file checkpoint restart and
+  legacy child-entrypoint inheritance. Test a real ZooKeeper/java-base downstream
+  source build too; vector changes trigger multiple product CI workflows.

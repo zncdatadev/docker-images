@@ -1,0 +1,18 @@
+data_dir = "/kubedoop/run/vector-state"
+
+[sources.log_file]
+type = "file"
+include = ["/kubedoop/run/input.log"]
+read_from = "beginning"
+fingerprint.strategy = "device_and_inode"
+
+[transforms.managed]
+type = "remap"
+inputs = ["log_file"]
+source = '.managed = true'
+
+[sinks.output]
+type = "file"
+inputs = ["managed"]
+path = "/kubedoop/run/output.json"
+encoding.codec = "json"
