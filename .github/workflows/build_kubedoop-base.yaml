@@ -11,7 +11,7 @@ on:
     branches:
       - main
     tags:
-        - '\d+.\d+.\d+*'
+        - '[0-9]+.[0-9]+.[0-9]+*'
     paths:
       - kubedoop-base/**
       - .github/workflows/build_kubedoop-base.yaml
@@ -93,6 +93,15 @@ jobs:
           push: ${{ github.event_name == 'push' }}
           sign: ${{ github.ref_type == 'tag' }}
           action_debug: 'false' # enable debug for the build-and-push action if needed
+
+      - name: Run base lifecycle and inheritance regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="${REGISTRY}/${PRODUCT_NAME}:${{ matrix.version }}-kubedoop${KUBEDOOP_VERSION}-${{ matrix.arch }}"
+          bash kubedoop-base/tests/source-entrypoint-framework.sh
+          bash kubedoop-base/tests/image-entrypoint-framework.sh "$image"
+          bash kubedoop-base/tests/image-inheritance.sh "$image"
 
 
   build-manifest:

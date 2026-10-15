@@ -1,0 +1,3 @@
+#!/bin/bash
+echo TEST_UNEXPECTED_LEGACY_ENTRYPOINT
+exit 99
