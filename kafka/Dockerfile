@@ -26,8 +26,6 @@ RUN <<EOF
 
 EOF
 
-COPY kubedoop/ /build/
-
 # build kafka
 # use cache locked to fix gradle concurrency lock issue https://github.com/gradle/gradle/issues/8750#issuecomment-2312378643
 RUN --mount=type=cache,sharing=locked,target=/root/.gradle <<EOF
@@ -61,6 +59,25 @@ RUN <<EOF
 EOF
 
 
+# stage: tini-downloader
+FROM zncdatadev/image/java-devel AS tini-downloader
+
+ARG TARGETARCH
+ARG TINI_VERSION
+
+RUN <<EOF
+    set -e
+    curl -sSfL -o /tmp/tini \
+        "https://github.com/krallin/tini/releases/download/v${TINI_VERSION}/tini-static-${TARGETARCH}"
+    case "${TARGETARCH}" in
+        arm64) expected_sha="eae1d3aa50c48fb23b8cbdf4e369d0910dfc538566bfd09df89a774aa84a48b9" ;;
+        amd64) expected_sha="c5b0666b4cb676901f90dfcb37106783c5fe2077b04590973b885950611b30ee" ;;
+        *) echo "Unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;;
+    esac
+    echo "${expected_sha}  /tmp/tini" | sha256sum -c
+    chmod +x /tmp/tini
+EOF
+
 ## stage: final
 FROM zncdatadev/image/java-base
 
@@ -69,6 +86,22 @@ ARG PRODUCT_VERSION
 WORKDIR /kubedoop
 
 COPY --from=kafka-builder --chown=kubedoop:kubedoop /kubedoop/ /kubedoop/
+
+# Commands own a session/group, separate from the entrypoint and post-hooks.
+RUN microdnf install -y util-linux-core && microdnf clean all
+
+COPY --from=tini-downloader /tmp/tini /usr/bin/tini
+COPY --chown=root:root kubedoop/lib/ /kubedoop/lib/
+COPY --chown=root:root kubedoop/bin/entrypoint.sh /kubedoop/bin/entrypoint.sh
+RUN chown root:kubedoop /kubedoop \
+    && chmod 1770 /kubedoop \
+    && chown -R root:root /kubedoop/lib/ /kubedoop/bin/ \
+    && chmod -R 0755 /kubedoop/lib/ /kubedoop/bin/ \
+    && mkdir -p /kubedoop/mount/pre-script /kubedoop/mount/post-script \
+    && chown -R root:root /kubedoop/mount/ \
+    && mkdir -p /kubedoop/run \
+    && chown kubedoop:kubedoop /kubedoop/run \
+    && chmod 1775 /kubedoop/run
 
 ENV KAFKA_HOME=/kubedoop/kafka
 ENV PATH="${KAFKA_HOME}/bin:${PATH}"
@@ -80,4 +113,5 @@ RUN kafka-server-start.sh --version
 
 WORKDIR /kubedoop/kafka
 
+ENTRYPOINT ["tini", "--", "/kubedoop/bin/entrypoint.sh"]
 CMD ["kafka-server-start.sh", "config/server.properties"]

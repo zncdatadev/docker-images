@@ -64,6 +64,8 @@ downloads/
 eggs/
 .eggs/
 lib/
+# Kafka-vendored lifecycle framework libraries.
+!kafka/kubedoop/lib/
 lib64/
 parts/
 sdist/
