@@ -1,6 +1,6 @@
 # Container Process Management Design
 
-> **Status**: Phase 1 (kubedoop-base) implemented. Init system: tini v0.19.0. Pod state and sidecar watchdog deferred.
+> **Status**: Piloting in the **zookeeper** image (product-first rollout, see [Rollout Strategy](#rollout-strategy-product-first)). Init system: tini v0.19.0. Extraction into `kubedoop-base`, pod-state coordination, and the sidecar watchdog are deferred.
 
 ## Design Goals
 
@@ -47,7 +47,7 @@ Product entrypoint:  /kubedoop/bin/start-app.sh   (product-specific, any name ex
 │   └── entrypoint.sh
 ├── lib/          root:root 0755  # Framework libraries
 │   ├── log.sh
-│   ├── run-phase.sh
+│   ├── run.sh
 │   ├── signal.sh
 │   └── pod-state.sh           (deferred)
 ├── mount/        root:root 0755  # Runtime injection layer (fixed mount points)
@@ -74,16 +74,16 @@ Kubernetes sends SIGTERM
 |  +- entrypoint.sh (PID 2) --------------------------------+ |
 |  |                                                         | |
 |  |  [1] source lib/*.sh                Load libraries      | |
-|  |  [2] run_phase mount/pre-script     Runtime pre-hooks   | |
+|  |  [2] run_pre_scripts                Operator pre-scripts | |
 |  |  [3] run_lifecycle "$@"             Start + manage      | |
-|  |      ├── trap '' SIGTERM SIGINT     Block signals       | |
-|  |      ├── "$@" & MAIN_PID=$!         Background CMD      | |
-|  |      ├── trap cleanup SIGTERM SIGINT Restore handler    | |
+|  |      ├── trap 'defer' SIGTERM SIGINT Defer (not SIG_IGN)| |
+|  |      ├── "$@" <&0 & MAIN_PID=$!     Background CMD      | |
+|  |      ├── trap cleanup SIGTERM SIGINT Arm real handler   | |
 |  |      └── wait $MAIN_PID             Wait for exit       | |
 |  |                                                         | |
 |  |  -- On SIGTERM received (via cleanup) --                 | |
 |  |  [4] stop_process $MAIN_PID         Graceful shutdown   | |
-|  |  [5] run_phase mount/post-script    Runtime post-hooks  | |
+|  |  [5] run_post_scripts               Operator post-scripts | |
 |  |  [6] exit $EXIT_CODE                Propagate exit      | |
 |  +---------------------------------------------------------+ |
 +--------------------------------------------------------------+
@@ -95,11 +95,10 @@ Kubernetes sends SIGTERM
 > Signal-aware shell scripts must not use `set -e` because trap handlers and `set -e`
 > interact unpredictably. All error handling is explicit.
 
-> **Note on signal handler safety**: `stop_process()` uses `sleep 1` in a polling loop
-> inside a trap handler. While `sleep` is not POSIX async-signal-safe, this is a
-> pragmatic trade-off in shell-based signal handling. The re-entrancy guard and trap
-> disarm in `cleanup()` mitigate the risk. This is acceptable for the target environment
-> (ubi9-minimal, bash 4.x) where heavy signal pressure is uncommon.
+> **Note on signals during cleanup**: `cleanup()` keeps its signal handlers installed.
+> Further SIGTERM/SIGINT signals cannot re-enter or abort cleanup. If they interrupt
+> Bash's `wait`, `stop_process()` resumes waiting for the child; a SIGALRM deadline
+> still enforces SIGKILL escalation. Post-scripts inherit normal signal dispositions.
 
 > **Note on KUBEDOOP_KILL_TIMEOUT**: Must be a positive integer >= 1. A value of 0
 > (immediate SIGKILL) is intentionally not supported — the graceful shutdown window
@@ -145,18 +144,36 @@ log_debug() {
 }
 ```
 
-### lib/run-phase.sh — Script Discovery and Execution Engine
+### lib/run.sh — Operator Script Discovery and Execution
 
 ```bash
 #!/bin/bash
-# /kubedoop/lib/run-phase.sh — Script auto-discovery and execution
+# /kubedoop/lib/run.sh -- Operator-provided lifecycle scripts
+#
+# Executes the scripts operators mount under /kubedoop/mount/:
+#   run_pre_scripts   - ${KUBEDOOP_MOUNT_DIR}/pre-script   (before the main process starts)
+#   run_post_scripts  - ${KUBEDOOP_MOUNT_DIR}/post-script  (after the main process stopped)
+#
+# Depends on: lib/log.sh (loaded via glob in entrypoint)
+#
+# Required global variables:
+#   KUBEDOOP_MOUNT_DIR - Path to mount directory (readonly, set by entrypoint)
 
-# Discover executable scripts in a directory, sorted by filename
-# Output: sorted list of script paths (one per line)
-discover_scripts() {
-    local phase_dir="$1"
+# Discover executable .sh scripts in a directory, sorted by filename.
+#
+# Arguments:
+#   $1 - Directory path to scan
+#
+# Output:
+#   stdout - Null-delimited sorted list of matching script paths, empty if none found
+#
+# Returns:
+#   0 - Discovery succeeded, or the directory does not exist
+#   1 - find or sort failed
+_discover_scripts() {
+    local scripts_dir="$1"
 
-    if [[ ! -d "$phase_dir" ]]; then
+    if [[ ! -d "$scripts_dir" ]]; then
         return 0
     fi
 
@@ -166,46 +183,110 @@ discover_scripts() {
     # With ConfigMap defaultMode: 0755, this correctly matches all executable scripts.
     # SECURITY: Only execute scripts owned by root (uid 0) to prevent injection
     # from non-root writable volumes (emptyDir, PVC, hostPath).
-    find "$phase_dir" -maxdepth 1 -type f -name '*.sh' -executable \
+    # ConfigMap/projected volumes expose symlinks into ..data. Follow links so
+    # type, ownership and executable checks apply to the target, not the link.
+    find -L "$scripts_dir" -maxdepth 1 -type f -name '*.sh' -executable \
         -uid 0 -print0 \
         | sort -z
+    local -a pipeline_status=("${PIPESTATUS[@]}")
+    if [[ "${pipeline_status[0]}" -ne 0 || "${pipeline_status[1]}" -ne 0 ]]; then
+        return 1
+    fi
+
+    return 0
 }
 
-# Run scripts sequentially (for pre-script / post-script)
-# Any script failure aborts the phase
-run_phase() {
-    local phase_name="$1"
-    local phase_dir="$2"
+# Execute all scripts found in a directory sequentially, in filename sort order.
+# First script failure aborts immediately.
+#
+# Arguments:
+#   $1 - Label for logging (e.g., "pre-script", "post-script")
+#   $2 - Directory containing executable .sh scripts
+#
+# Returns:
+#   0 - All scripts succeeded, or no scripts found
+#   1 - A script failed, or script discovery failed
+_run_scripts() {
+    local label="$1"
+    local scripts_dir="$2"
 
-    if [[ ! -d "$phase_dir" ]]; then
+    if [[ ! -d "$scripts_dir" ]]; then
         return 0
     fi
 
     local count=0
     local found_any=false
+    local script_list
 
-    while IFS= read -r -d '' script; do
+    # Process substitution hides the producer's exit status from the while loop.
+    # Materialize the null-delimited list first so discovery errors (permission
+    # denied, I/O errors, etc.) fail the run instead of looking like an empty
+    # directory. KUBEDOOP_RUN_DIR is the writable runtime area in the image.
+    if ! script_list=$(mktemp "${KUBEDOOP_RUN_DIR:-/tmp}/.scripts.XXXXXX"); then
+        log_error "$label: failed to create script discovery file"
+        return 1
+    fi
+
+    if ! _discover_scripts "$scripts_dir" > "$script_list"; then
+        log_error "$label: failed to discover scripts in $scripts_dir"
+        rm -f "$script_list"
+        return 1
+    fi
+
+    local script_list_fd
+    if ! exec {script_list_fd}<"$script_list"; then
+        log_error "$label: failed to read discovered script list"
+        rm -f "$script_list"
+        return 1
+    fi
+    rm -f "$script_list"
+
+    while IFS= read -r -d '' -u "$script_list_fd" script; do
         found_any=true
         local name
         name=$(basename "$script")
-        log_info "Phase '$phase_name': running $name"
+        log_info "$label: running $name"
         count=$((count + 1))
 
         local rc=0
-        "$script" || rc=$?
+        # Hooks are non-interactive and must not consume the discovery stream.
+        "$script" </dev/null {script_list_fd}<&- || rc=$?
         if [[ $rc -ne 0 ]]; then
-            log_error "Phase '$phase_name': $name failed with exit code $rc"
+            log_error "$label: $name failed with exit code $rc"
+            exec {script_list_fd}<&-
             return 1
         fi
-    done < <(discover_scripts "$phase_dir")
+    done
+
+    exec {script_list_fd}<&-
 
     if [[ "$found_any" == false ]]; then
-        log_info "Phase '$phase_name': no scripts found in $phase_dir"
+        log_info "$label: no scripts found"
         return 0
     fi
 
-    log_info "Phase '$phase_name': completed ($count scripts)"
+    log_info "$label: completed ($count scripts)"
     return 0
+}
+
+# Execute operator-injected pre-scripts. Runs before the main process starts;
+# a failure makes the caller abort startup (fail-fast).
+#
+# Returns:
+#   0 - All pre-scripts succeeded, or none found
+#   1 - A pre-script failed, or discovery failed
+run_pre_scripts() {
+    _run_scripts "pre-script" "${KUBEDOOP_MOUNT_DIR}/pre-script"
+}
+
+# Execute operator-injected post-scripts. Runs during shutdown cleanup, after
+# the main process stopped; the caller decides how to handle failure.
+#
+# Returns:
+#   0 - All post-scripts succeeded, or none found
+#   1 - A post-script failed, or discovery failed
+run_post_scripts() {
+    _run_scripts "post-script" "${KUBEDOOP_MOUNT_DIR}/post-script"
 }
 ```
 
@@ -213,12 +294,12 @@ run_phase() {
 
 ```bash
 #!/bin/bash
-# /kubedoop/lib/signal.sh — Process lifecycle management
+# /kubedoop/lib/signal.sh -- Process lifecycle management
 #
 # Provides graceful process termination, cleanup orchestration,
 # and full lifecycle management for the universal entrypoint.
 #
-# Depends on: lib/log.sh, lib/run-phase.sh (loaded via glob in entrypoint)
+# Depends on: lib/log.sh, lib/run.sh (loaded via glob in entrypoint)
 #
 # Required global variables (set by entrypoint before calling run_lifecycle):
 #   KUBEDOOP_KILL_TIMEOUT - Max seconds to wait before SIGKILL (readonly)
@@ -237,8 +318,9 @@ run_phase() {
 #   $2 - Timeout in seconds before SIGKILL escalation
 #
 # Side effects:
-#   Sets STOP_EXIT_CODE to the reaped exit code (empty if PID is empty or already reaped)
-#   Sets STOP_REAPED=1 if the process was reaped, 0 if no PID or already reaped
+#   Caller must supply an owned child whose status has not yet been consumed.
+#   Sets STOP_EXIT_CODE to the child's exit code (including a legitimate 127).
+#   Sets STOP_REAPED=1 after wait, 0 if no PID was supplied.
 stop_process() {
     local pid="$1"
     local timeout="$2"
@@ -255,75 +337,94 @@ stop_process() {
     if ! kill -0 "$pid" 2>/dev/null; then
         wait "$pid" 2>/dev/null
         local rc=$?
-        if [[ $rc -eq 127 ]]; then
-            # Not a child of this shell — already reaped, exit code unknown
-            STOP_REAPED=0
-        else
-            STOP_EXIT_CODE=$rc
-            STOP_REAPED=1
-        fi
+        STOP_EXIT_CODE=$rc
+        STOP_REAPED=1
         return 0
     fi
 
     log_info "Forwarding SIGTERM to main process (PID: $pid)"
     kill -TERM "$pid" 2>/dev/null || true
 
-    # Wait for process to exit (with timeout protection)
-    local elapsed=0
-    while kill -0 "$pid" 2>/dev/null && [[ $elapsed -lt $timeout ]]; do
-        sleep 1
-        elapsed=$((elapsed + 1))
+    # Reap process to capture exit code. Use a SIGALRM timer for timeout
+    # protection instead of polling with kill -0: a dead-but-unreaped child is
+    # still visible to kill -0 as a zombie, which can add a full timeout delay
+    # even after graceful shutdown has completed.
+    local timed_out=0
+    local shell_pid="$BASHPID"
+    (
+        sleep "$timeout"
+        kill -ALRM "$shell_pid" 2>/dev/null
+    ) &
+    local timer_pid=$!
+
+    trap 'timed_out=1; log_warn "Main process did not exit in ${timeout}s, sending SIGKILL"; kill -KILL "$pid" 2>/dev/null || true' SIGALRM
+
+    local rc=0
+    while :; do
+        timed_out=0
+        _CLEANUP_INTERRUPTED=0
+        wait "$pid" 2>/dev/null
+        rc=$?
+        # A handled signal interrupts Bash's wait without consuming the child's
+        # status. Keep waiting after repeated shutdown signals or the timeout
+        # alarm, but preserve real application exit codes (including 130/142/143).
+        if [[ "$timed_out" -eq 1 && "$rc" -eq $((128 + 14)) ]] ||
+            [[ "$_CLEANUP_INTERRUPTED" -eq 1 && ( "$rc" -eq 130 || "$rc" -eq 143 ) ]]; then
+            continue
+        fi
+        break
     done
 
-    # Force kill on timeout
-    if kill -0 "$pid" 2>/dev/null; then
-        log_warn "Main process did not exit in ${timeout}s, sending SIGKILL"
-        kill -KILL "$pid" 2>/dev/null || true
-    fi
+    trap - SIGALRM
+    kill "$timer_pid" 2>/dev/null || true
+    wait "$timer_pid" 2>/dev/null || true
 
-    # Reap process to capture exit code
-    wait "$pid" 2>/dev/null
-    local rc=$?
-    if [[ $rc -eq 127 ]]; then
-        # Not a child of this shell — already reaped, exit code unknown
-        STOP_REAPED=0
-    else
-        STOP_EXIT_CODE=$rc
-        STOP_REAPED=1
-    fi
+    STOP_EXIT_CODE=$rc
+    STOP_REAPED=1
 }
 
 # Graceful shutdown handler. Invoked via SIGTERM/SIGINT trap by run_lifecycle.
 #
 # Steps:
 #   1. Guard against re-entrant execution
-#   2. Disarm signal traps to prevent nested handler execution
+#   2. Keep handling shutdown signals without re-entering cleanup
 #   3. Stop main process (SIGTERM → wait → SIGKILL escalation)
 #   4. Capture actual exit code from reap
 #   5. Run post-script phase hooks
+#
+# Environment:
+#   MAIN_PID              - PID of the main process (set by run_lifecycle)
+#   KUBEDOOP_KILL_TIMEOUT - Max seconds to wait before SIGKILL (readonly)
+#
+# Returns:
+#   0 - Always (best-effort cleanup, errors are logged but not propagated)
 cleanup() {
     # Prevent re-entrant execution (trap + fallthrough race)
     if [[ "${_CLEANUP_RUNNING:-0}" -eq 1 ]]; then
+        _CLEANUP_INTERRUPTED=1
         return 0
     fi
     _CLEANUP_RUNNING=1
 
-    # Disarm signal traps during cleanup to prevent nested handler execution
-    trap - SIGTERM SIGINT
+    # Leave the real handler installed: restoring SIG_DFL would abort cleanup
+    # on another signal; SIG_IGN would also be inherited by post-script hooks.
 
     log_info "Starting shutdown cleanup"
 
-    stop_process "$MAIN_PID" "$KUBEDOOP_KILL_TIMEOUT"
-
-    # Capture real exit code if process was reaped during signal path
-    if [[ "$STOP_REAPED" -eq 1 && -n "$STOP_EXIT_CODE" ]]; then
-        EXIT_CODE="$STOP_EXIT_CODE"
+    # Track reaping explicitly: 127 is a valid application exit status, not
+    # evidence that wait has already consumed the child's status.
+    if [[ "$_MAIN_REAPED" -eq 0 ]]; then
+        stop_process "$MAIN_PID" "$KUBEDOOP_KILL_TIMEOUT"
+        if [[ "$STOP_REAPED" -eq 1 ]]; then
+            EXIT_CODE="$STOP_EXIT_CODE"
+            _MAIN_REAPED=1
+        fi
     fi
 
     log_info "Main process stopped"
 
-    # Phase: Runtime post-script hooks (auto-discovered from mount)
-    run_phase "post-script" "${KUBEDOOP_MOUNT_DIR}/post-script" || true
+    # Operator post-scripts (auto-discovered from mount); best-effort
+    run_post_scripts || true
 
     log_info "Shutdown complete"
 }
@@ -345,25 +446,59 @@ run_lifecycle() {
     MAIN_PID=""
     EXIT_CODE=0
     _CLEANUP_RUNNING=0
+    _CLEANUP_INTERRUPTED=0
+    _PENDING_SIGNAL=0
+    _MAIN_REAPED=0
 
-    # Block signals during process start to prevent cleanup() with empty MAIN_PID
-    trap '' SIGTERM SIGINT
+    # Defer signals during process start to close the race where SIGTERM arrives
+    # before MAIN_PID is captured (which would run cleanup() with an empty PID).
+    #
+    # CRITICAL: use a real handler that records a pending flag — NOT `trap ''`.
+    # `trap '' SIGTERM` installs SIG_IGN, which is INHERITED by the backgrounded
+    # child across fork/exec. A non-interactive child shell cannot re-trap a
+    # signal that was ignored on entry, so the child (and any SIGTERM handler it
+    # installs, e.g. a product entrypoint) would silently ignore graceful
+    # shutdown — the exact opposite of this framework's guarantee. A real trap
+    # handler is reset to SIG_DFL in the execed child, so the child receives
+    # SIGTERM normally and may install its own handler.
+    trap '_PENDING_SIGNAL=1' SIGTERM SIGINT
 
     # Start process and capture PID atomically (same logical line as backgrounding)
-    "$@" & MAIN_PID=$!
+    # Explicit redirection preserves stdin; otherwise non-interactive Bash
+    # connects a background command's stdin to /dev/null.
+    "$@" <&0 & MAIN_PID=$!
 
-    # Restore signal handler immediately after PID capture — minimizes race window
+    # Swap the deferring handler for the real cleanup handler.
     trap cleanup SIGTERM SIGINT
 
-    log_info "Main process started (PID: $MAIN_PID): $*"
+    log_info "Main process started (PID: $MAIN_PID)"
 
-    # Wait for main process to exit
-    wait $MAIN_PID || EXIT_CODE=$?
-
-    # Run cleanup (if not already triggered by signal trap)
-    if [[ "${_CLEANUP_RUNNING:-0}" -ne 1 ]]; then
+    # If a signal arrived during the start window, the deferring handler recorded
+    # it. Run cleanup now (with a valid MAIN_PID) instead of waiting.
+    if [[ "$_PENDING_SIGNAL" -eq 1 ]]; then
+        log_info "Signal received during startup, initiating shutdown"
         cleanup
     fi
+
+    # Wait for the main process to exit.
+    #
+    # Two paths reach this point:
+    #   Normal exit — main process exits on its own; wait returns its real code.
+    #   Signal path — SIGTERM/SIGINT arrives during wait, firing the cleanup()
+    #                 trap. cleanup() reaps the child and sets EXIT_CODE to the
+    #                 real reaped code. The interrupted wait then returns
+    #                 128+signum (e.g. 143 for SIGTERM), which must NOT clobber
+    #                 the real exit code cleanup() already captured.
+    local rc=0
+    wait "$MAIN_PID" || rc=$?
+
+    if [[ "${_CLEANUP_RUNNING:-0}" -ne 1 ]]; then
+        # Normal exit path: capture the real exit code, then run cleanup hooks.
+        EXIT_CODE=$rc
+        _MAIN_REAPED=1
+        cleanup
+    fi
+    # Signal path: cleanup() already ran and set EXIT_CODE — leave it intact.
 }
 ```
 
@@ -470,7 +605,7 @@ wait_for_state() {
 
 ```bash
 #!/bin/bash
-# /kubedoop/bin/entrypoint.sh — Universal container entrypoint
+# /kubedoop/bin/entrypoint.sh -- Universal container entrypoint
 #
 # Note: Uses set -uo pipefail WITHOUT -e.
 # Signal-aware scripts must not use set -e because trap handlers
@@ -498,7 +633,7 @@ mkdir -p "${KUBEDOOP_RUN_DIR}"
 
 # Load common libraries.
 # Libraries load in glob sort order. If a library depends on another,
-# it must document this requirement (e.g., signal.sh depends on log.sh and run-phase.sh).
+# it must document this requirement (e.g., signal.sh depends on log.sh and run.sh).
 for lib in "${KUBEDOOP_HOME}/lib/"*.sh; do
     if [[ -f "$lib" ]]; then
         # shellcheck source=/dev/null
@@ -506,24 +641,25 @@ for lib in "${KUBEDOOP_HOME}/lib/"*.sh; do
     fi
 done
 
-log_info "Entrypoint starting: $*"
+# Arguments may contain credentials; never include them in framework logs.
+log_info "Entrypoint starting"
 
-# --- Phase 1: Runtime pre-script hooks (auto-discovered from mount) ---
+# --- Step 1: Operator pre-scripts (auto-discovered from mount) ---
 # Note: pre-script failure prevents main process startup (fail-fast).
 # Operators must test injected scripts in non-production environments first.
-if ! run_phase "pre-script" "${KUBEDOOP_MOUNT_DIR}/pre-script"; then
-    log_error "Pre-script phase failed, aborting startup"
+if ! run_pre_scripts; then
+    log_error "Pre-scripts failed, aborting startup"
     exit 1
 fi
 
-# --- Phase 2: Start main process and manage lifecycle ---
+# --- Step 2: Start main process and manage lifecycle ---
 if [[ $# -eq 0 ]]; then
     log_error "No command specified"
     exit 1
 fi
 
 run_lifecycle "$@"
-exit $EXIT_CODE
+exit "$EXIT_CODE"
 ```
 
 ### kubedoop-base/Dockerfile Integration
@@ -531,26 +667,35 @@ exit $EXIT_CODE
 ```dockerfile
 # Append to existing kubedoop-base Dockerfile
 
-# Install init system
+# stage: tini-downloader
+# Download and verify the init system in a build stage — the result image only
+# receives the verified binary and never runs download tooling.
 # tini: lightweight init, signal forwarding to direct child, zombie reaping
-# Not available in UBI 9 repos — download static binary from GitHub releases
-# SHA256 checksums are hardcoded in the verification step to prevent --build-arg override
+# Not available in UBI 9 repos — download static binary from GitHub releases.
+FROM registry.access.redhat.com/ubi9/ubi-minimal:9.6 AS tini-downloader
+
+RUN microdnf install -y curl && microdnf clean all
+
 ARG TARGETARCH
-ADD https://github.com/krallin/tini/releases/download/v0.19.0/tini-static-${TARGETARCH} /tmp/tini
 RUN <<EOF
     set -e
+    curl -sSfL -o /tmp/tini \
+        "https://github.com/krallin/tini/releases/download/v0.19.0/tini-static-${TARGETARCH}"
+
+    # SHA256 checksums are hardcoded in the verification step to prevent --build-arg override
     case "${TARGETARCH}" in
         arm64)  expected_sha="eae1d3aa50c48fb23b8cbdf4e369d0910dfc538566bfd09df89a774aa84a48b9" ;;
         amd64)  expected_sha="c5b0666b4cb676901f90dfcb37106783c5fe2077b04590973b885950611b30ee" ;;
         *)      echo "Unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;;
     esac
     echo "${expected_sha}  /tmp/tini" | sha256sum -c
-    mv /tmp/tini /usr/bin/tini
-    chmod +x /usr/bin/tini
+    chmod +x /tmp/tini
 EOF
 
 # Deploy universal entrypoint framework
 # Framework files: root-owned, world-readable/executable, NOT writable by kubedoop
+COPY --from=tini-downloader /tmp/tini /usr/bin/tini
+
 COPY --chown=root:root kubedoop/lib/ /kubedoop/lib/
 COPY --chown=root:root kubedoop/bin/entrypoint.sh /kubedoop/bin/entrypoint.sh
 RUN chmod -R 0755 /kubedoop/lib/ /kubedoop/bin/ \
@@ -929,12 +1074,39 @@ spec:
 
 For K8s >= 1.28, the native sidecar handles start/stop ordering. State files provide early flush triggering (the sidecar starts draining before K8s even sends SIGTERM), which reduces log loss during shutdown. State files also provide visibility (PID, exit code) for debugging.
 
+## Rollout Strategy: Product-First
+
+The end-state design deploys the framework once in `kubedoop-base` so every image
+inherits it (see [kubedoop-base/Dockerfile Integration](#kubedoop-basedockerfile-integration)).
+However, **any change to `kubedoop-base` rebuilds every downstream image** in the PR
+pipeline, which is prohibitively slow while the framework itself is still being iterated on.
+
+To avoid that, the framework is rolled out **product-first**:
+
+1. **Pilot in a single product image** — the framework source (`lib/`, `bin/entrypoint.sh`)
+   is vendored under the product directory (e.g. `zookeeper/kubedoop/{lib,bin}`), and the
+   tini install + framework deploy steps live in that product's `Dockerfile`. Only that one
+   image rebuilds. **zookeeper** is the first pilot (a simple, zero-script product).
+2. **Repeat for a few more products** to validate the contract across shapes (zero-script,
+   product-entrypoint, complex-entrypoint).
+3. **Extract upward into `kubedoop-base`** once proven. At that point the per-product
+   `lib/`, `bin/`, and Dockerfile steps are removed in favour of inheritance — this is the
+   original Phase 1 below, executed last instead of first.
+
+The framework contents are identical in both placements; only the *layer* they live in
+changes. This means a product piloting the framework today needs no code changes when the
+extraction lands — its `Dockerfile` simply drops the now-inherited steps.
+
 ## Gradual Migration Path
+
+> **Note**: Under the [product-first rollout](#rollout-strategy-product-first), Phase 1 is
+> executed **last** (extraction into `kubedoop-base`), after the framework has been piloted
+> in individual product images. The phases below describe the end-state layering.
 
 ### Phase 1: Infrastructure
 
 - kubedoop-base installs chosen init system
-- Deploy `lib/` (log.sh, run-phase.sh, signal.sh) and `bin/entrypoint.sh`
+- Deploy `lib/` (log.sh, run.sh, signal.sh) and `bin/entrypoint.sh`
 - Create empty `mount/{pre-script,post-script}` directories
 
 ### Phase 2: Simple Products (Zero-script Products)
@@ -1031,7 +1203,7 @@ The security model protects the **container image** (framework + application), n
 
 **What is NOT protected**: Writable paths explicitly mounted by the operator (log directories, PVC data, hostPath mounts). This is by design — the operator controls the trust boundary.
 
-**State file protection**: The entrypoint cleans stale/fake state files after pre-scripts run but before the main process starts (see `rm -f` in entrypoint.sh). This prevents injected pre-scripts from poisoning sidecar coordination with fake `main.status` or `main.pid` values. Pre-scripts are trusted not to write state files between the cleanup and the real state writes (a sub-millisecond window).
+**State file protection** (deferred, ships with pod-state coordination): once state files are written, the entrypoint will clean stale/fake state files after pre-scripts run but before the main process starts (a `rm -f` step in entrypoint.sh). This prevents injected pre-scripts from poisoning sidecar coordination with fake `main.status` or `main.pid` values. Pre-scripts are trusted not to write state files between the cleanup and the real state writes (a sub-millisecond window). Until `lib/pod-state.sh` is deployed, no state files are written and this cleanup is not present.
 
 ## Architecture Relationship
 
