@@ -6,7 +6,7 @@ Trino SQL query engine. Only product with an external plugin build (trino-storag
 
 ## Build Details
 - Build command: `make trino-build`
-- Build stages: (1) storage-connector-builder builds trino-storage from snowlift/trino-storage GitHub, (2) trino-builder builds Trino from source excluding docs, copies storage connector plugin into plugin directory, applies log4shell patch, (3) final runtime stage
+- Build stages: storage-connector-builder, trino-builder, checksum-verified tini-downloader, and final runtime stage. Runtime lifecycle files are copied only into the final stage.
 - Build system: Maven (./mvnw wrapper)
 - Base images: java-devel (builder) → java-base (runtime)
 
@@ -19,6 +19,7 @@ See `versions.yaml` for current values. Structure:
 | java-devel | JDK version for builder image (22, 23, 24) |
 | jmx-exporter | JMX exporter version |
 | storage-connector | trino-storage plugin version (pegged to Trino version) |
+| tini | Init system version (0.19.0) |
 
 ## Kubedoop Customizations
 ### Patches
@@ -26,7 +27,11 @@ See `versions.yaml` for current values. Structure:
 ### JMX Configuration
 - `kubedoop/jmx/config/config.yaml` — minimal: only `lowercaseOutputName: true`
 ### Custom Scripts
-- NONE
+- `kubedoop/bin/entrypoint.sh` and `kubedoop/lib/` — independently vendored lifecycle framework
+- `tests/source-entrypoint-framework.sh` — source lifecycle regressions
+- `tests/image-entrypoint-framework.sh` — image wiring, hooks, signals, stdin and exit-code regressions
+- `tests/image-trino-lifecycle.sh` — real single-node SQL, graceful stop and restart acceptance
+- Framework commands own a separate session/group drained before post-hooks; timeout cancellation/reaping precedes ALRM handler removal. All versions require root/UID1001 SQL/TPCH across three same-container starts, TERM/INT/stop, stable identity and exactly-once ordered hooks.
 
 ## Dependencies
 - Uses at build time: java-devel

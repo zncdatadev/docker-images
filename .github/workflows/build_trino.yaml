@@ -11,7 +11,7 @@ on:
     branches:
       - main
     tags:
-        - '\d+.\d+.\d+*'
+        - '[0-9]+.[0-9]+.[0-9]+*'
     paths:
       - trino/**
       - kubedoop-base/**
@@ -59,6 +59,7 @@ jobs:
     needs:
       - product-shard
     strategy:
+      fail-fast: false
       matrix:
         version: ${{fromJson(needs.product-shard.outputs.versions)}}
         arch: [amd64, arm64]
@@ -101,6 +102,16 @@ jobs:
           push: ${{ github.event_name == 'push' }}
           sign: ${{ github.ref_type == 'tag' }}
           action_debug: 'false' # enable debug for the build-and-push action if needed
+
+      - name: Run Trino lifecycle tests
+        shell: bash
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.PRODUCT_NAME }}:${{ matrix.version }}-kubedoop${{ env.KUBEDOOP_VERSION }}-${{ matrix.arch }}
+        run: |
+          trino/tests/source-entrypoint-framework.sh
+          sudo bash trino/tests/source-entrypoint-framework.sh
+          trino/tests/image-entrypoint-framework.sh "$IMAGE"
+          trino/tests/image-trino-lifecycle.sh "$IMAGE"
 
 
   build-manifest:
