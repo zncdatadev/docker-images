@@ -14,7 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-set -e
+set -euo pipefail
+umask 077
 
 __usage="
 Usage: krb5-setup [OPTIONS]
@@ -36,37 +37,28 @@ PASSWORD=$(openssl rand -base64 12)
 KADMIN_PASSWORD="changeit"
 
 function main () {
-    case $1 in
-        -h|--help)
-            echo "$__usage"
-            exit 0
-            ;;
-        -p|--password)
-            PASSWORD=$2
-            shift 2
-            ;;
-        -r|--realm)
-            REALM=$2
-            shift 2
-            ;;
-        -d|--domain)
-            DOMAIN=$2
-            shift 2
-            ;;
-        --kadmin-password)
-            KADMIN_PASSWORD=$2
-            shift 2
-            ;;
-        *)
-            ;;
-    esac
-
-    if [[ -z ${DOMAIN} ]]; then
-        DOMAIN=$(echo ${REALM} | tr '[:upper:]' '[:lower:]')
-    fi
-
-    echo "Realm: ${REALM}, Domain: ${DOMAIN}"
-
+    while (($#)); do
+        case "$1" in
+            -h|--help) printf '%s\n' "$__usage"; return 0 ;;
+            -p|--password|-r|--realm|-d|--domain|--kadmin-password|--kadmind-password)
+                (($# >= 2)) && [[ -n "$2" ]] || { log error "Option requires a value"; return 2; }
+                case "$1" in
+                    -p|--password) PASSWORD=$2 ;;
+                    -r|--realm) REALM=$2 ;;
+                    -d|--domain) DOMAIN=$2 ;;
+                    *) KADMIN_PASSWORD=$2 ;;
+                esac
+                shift 2 ;;
+            *) log error "Unknown setup option"; return 2 ;;
+        esac
+    done
+    [[ "$REALM" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || { log error "Invalid realm"; return 2; }
+    if [[ -z "$DOMAIN" ]]; then DOMAIN=${REALM,,}; fi
+    [[ "$DOMAIN" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || { log error "Invalid domain"; return 2; }
+    # The kadmin query language is not shell quoting; reject its metacharacters
+    # instead of allowing a supplied password to inject a second query.
+    [[ "$KADMIN_PASSWORD" =~ ^[A-Za-z0-9._/@%+=:-]+$ ]] || { log error "Unsupported admin password characters"; return 2; }
+    log info "Realm: ${REALM}, Domain: ${DOMAIN}"
     init_krb5
 }
 
@@ -133,10 +125,10 @@ admin/admin@${REALM}	*e
 */admin@${REALM}	*
 EOF
 
-    kdb5_util create -s -r ${REALM} -P ${PASSWORD}
+    kdb5_util create -s -r "${REALM}" -P "${PASSWORD}"
 
     log warn "krb5kdc admin password stored in /tmp/krb5kdc_admin_password"
-    echo ${PASSWORD} > /tmp/krb5kdc_admin_password
+    printf '%s\n' "$PASSWORD" > /tmp/krb5kdc_admin_password
 
     # add admin/admin principal
     kadmin.local -q "addprinc -pw ${KADMIN_PASSWORD} admin/admin@${REALM}"
@@ -146,8 +138,8 @@ EOF
 
     log info "krb5kdc and kadmin initialized"
     
-    # enable krb5kdc and kadmin
-    systemctl enable krb5kdc kadmin
+    # Fixed systemd units are enabled at image build time. On same-container
+    # restarts /run can retain a stale systemd bus; do not contact it here.
 }
 
 
@@ -170,35 +162,10 @@ function init_krb5 () {
     init_krb5kdc
 }
 
-# Log function to support colored output
+# Setup messages never include supplied passwords or command arguments.
 function log() {
-    local color=""
-    local message=""
-
-    case $1 in
-        info)
-            color="\e[0m"  # White color
-            message="${@:2}"
-            ;;
-        warn)
-            color="\e[33m"  # Yellow color
-            message="${@:2}"
-            ;;
-        error)
-            color="\e[31m"  # Red color
-            message="${@:2}"
-            ;;
-        *)
-            echo "Invalid log level: $1"
-            return 1
-            ;;
-    esac
-
-    echo -e "${color}${message}\e[0m"
+    local level="$1"; shift
+    printf '[krb5] [%s] %s\n' "$level" "$*" >&2
 }
 
 main "$@"
-
-exec /usr/sbin/init
-
-exit 10

@@ -11,7 +11,7 @@ on:
     branches:
       - main
     tags:
-        - '\d+.\d+.\d+*'
+        - '[0-9]+.[0-9]+.[0-9]+*'
     paths:
       - krb5/**
       - .github/workflows/build_krb5.yaml
@@ -51,6 +51,8 @@ jobs:
     needs:
       - product-shard
     strategy:
+      # Keep native shutdown evidence from both architectures on a test failure.
+      fail-fast: false
       matrix:
         version: ${{fromJson(needs.product-shard.outputs.versions)}}
         arch: [amd64, arm64]
@@ -93,6 +95,15 @@ jobs:
           push: ${{ github.event_name == 'push' }}
           sign: ${{ github.ref_type == 'tag' }}
           action_debug: 'false' # enable debug for the build-and-push action if needed
+
+      - name: Run Kerberos lifecycle and systemd regressions
+        shell: bash
+        run: |
+          # Run build uses --arch-suffix even when a PR only loads the image locally.
+          image="${{ env.REGISTRY }}/krb5:${{ matrix.version }}-kubedoop${{ env.KUBEDOOP_VERSION }}-${{ matrix.arch }}"
+          sudo bash krb5/tests/source-entrypoint-framework.sh
+          bash krb5/tests/image-entrypoint-framework.sh "$image"
+          bash krb5/tests/image-kerberos.sh "$image"
 
 
   build-manifest:

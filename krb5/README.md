@@ -2,7 +2,61 @@
 
 Install krb5 service using rockylinux9 and automatically initialize krb5kdc and kadmin services when running the container for the first time, then run the services using systemd.
 
-Unlike other containers, containers running as systemd services may not capture stop signals such as `CTRL+C` correctly and may require manual stopping in certain cases.
+The default mode keeps systemd as PID 1. Docker stop now uses systemd's native
+`SIGRTMIN+3` orderly shutdown signal; raw `SIGTERM`/`SIGINT` have systemd
+semantics, not the foreground supervisor semantics described below.
+
+## Container lifecycle modes
+
+- No mode flag: initialize once and exec systemd, preserving existing service
+  names, ports, configuration paths and root identity.
+- `--foreground [setup options]`: run real `krb5kdc -n` and
+  `kadmind -nofork` under Tini without privileged/cgroup access. If either
+  daemon exits, the other is stopped before post-hooks run.
+- `--exec COMMAND [ARG...]`: run an explicit command without initializing a
+  KDC. Preserve stdin, clean command stdout and its actual exit status.
+
+For example, a development KDC without host cgroup or daemon changes:
+
+```bash
+docker run --name krb5 quay.io/zncdatadev/krb5:1.21.1-kubedoop0.0.0-dev \
+  --foreground --realm EXAMPLE.COM --domain example.com \
+  --password test-master-password --kadmin-password test-admin-password
+```
+
+The passwords above are development examples. Both `--kadmin-password` and the
+previous README spelling `--kadmind-password` are accepted. All setup options
+are parsed, not only the first one. Missing/unknown values and unsafe realm,
+domain or admin-query characters fail closed without printing argument values.
+Admin passwords currently accept letters, digits and `._/@%+=:-`.
+The generated master-password file is mode 0600.
+
+Mount root-owned executable `.sh` hooks at
+`/kubedoop/mount/pre-script` and `/kubedoop/mount/post-script`. They run in
+filename order, including projected-volume symlinks; hook stdin is
+`/dev/null`. A pre-hook failure aborts startup. Post-hooks run only after the
+owned processes stop; foreground post-hook failure does not mask main status.
+In systemd mode the ordered oneshot unit records a failed post-hook as a unit
+failure, and does not replace systemd's container exit status.
+
+Foreground modes forward TERM, INT and Docker's RTMIN+3 stop signal as TERM
+to the owned process group, then escalate to KILL after
+`KUBEDOOP_KILL_TIMEOUT` (positive integer, default 30 seconds). Detached
+processes escaping that session are unsupported. Systemd mode uses native
+service control groups and 30-second stop deadlines; arbitrary
+`KUBEDOOP_KILL_TIMEOUT` environment values do not configure systemd units.
+Do not add Docker `--init` to the default systemd mode.
+
+Same-container restarts retain the database and never recreate an initialized
+realm. The existing `/data` volume is **not** an automatic KDC database mapping:
+for replacement-container persistence, preserve both
+`/var/kerberos/krb5kdc` and the matching `/etc/krb5.conf`, plus a stable
+hostname. Existing data is never reformatted by lifecycle startup.
+
+Native behavior references:
+[systemd container interface](https://systemd.io/CONTAINER_INTERFACE/),
+[MIT krb5kdc](https://web.mit.edu/kerberos/krb5-1.21/doc/admin/admin_commands/krb5kdc.html),
+[MIT kadmind](https://web.mit.edu/kerberos/krb5-1.21/doc/admin/admin_commands/kadmind.html).
 
 ## Usage
 
