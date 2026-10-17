@@ -26,7 +26,9 @@ RUN <<EOF
     mvn --version | grep "Apache Maven ${MAVEN_VERSION}" || exit 1
 EOF
 
-COPY kubedoop /build/
+COPY kubedoop/apply_patches.sh /build/
+COPY kubedoop/maven-settings.xml /build/
+COPY kubedoop/patches/ /build/patches/
 
 # Build apache nifi from github tag
 RUN --mount=type=cache,target=/root/.m2 --mount=type=cache,target=/root/.npm <<EOF
@@ -45,6 +47,7 @@ RUN --mount=type=cache,target=/root/.m2 --mount=type=cache,target=/root/.npm <<E
 
     # Build apache nifi use mvnw
     ./mvnw \
+        --settings /build/maven-settings.xml \
         clean \
         install \
         --batch-mode \
@@ -83,6 +86,25 @@ RUN --mount=type=cache,target=/root/.m2 --mount=type=cache,target=/root/.npm <<E
 EOF
 
 
+## stage: tini-downloader
+FROM zncdatadev/image/java-devel AS tini-downloader
+
+ARG TARGETARCH
+ARG TINI_VERSION
+
+RUN <<EOF
+    set -e
+    curl -sSfL -o /tmp/tini \
+        "https://github.com/krallin/tini/releases/download/v${TINI_VERSION}/tini-static-${TARGETARCH}"
+    case "${TARGETARCH}" in
+        arm64) expected_sha="eae1d3aa50c48fb23b8cbdf4e369d0910dfc538566bfd09df89a774aa84a48b9" ;;
+        amd64) expected_sha="c5b0666b4cb676901f90dfcb37106783c5fe2077b04590973b885950611b30ee" ;;
+        *) echo "Unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;;
+    esac
+    echo "${expected_sha}  /tmp/tini" | sha256sum -c
+    chmod +x /tmp/tini
+EOF
+
 ## Final stage
 FROM zncdatadev/image/java-base
 
@@ -92,6 +114,7 @@ RUN <<EOF
         gettext \
         git \
         python3-pip \
+        util-linux-core \
 
     microdnf clean all
     rm -rf /var/cache/yum
@@ -103,9 +126,23 @@ EOF
 
 COPY --from=nifi-builder --chown=kubedoop:kubedoop /kubedoop/ /kubedoop/
 
+COPY --from=tini-downloader /tmp/tini /usr/bin/tini
+COPY --chown=root:root kubedoop/lib/ /kubedoop/lib/
+COPY --chown=root:root kubedoop/bin/entrypoint.sh /kubedoop/bin/entrypoint.sh
+RUN chown root:kubedoop /kubedoop \
+    && chmod 1770 /kubedoop \
+    && chown root:root /kubedoop/lib /kubedoop/bin \
+    && chmod -R 0755 /kubedoop/lib/ /kubedoop/bin/ \
+    && mkdir -p /kubedoop/mount/pre-script /kubedoop/mount/post-script \
+    && chown -R root:root /kubedoop/mount/ \
+    && mkdir -p /kubedoop/run \
+    && chown kubedoop:kubedoop /kubedoop/run \
+    && chmod 1775 /kubedoop/run
+
 ENV NIFI_HOME=/kubedoop/nifi
 ENV PATH="${NIFI_HOME}/bin:${PATH}"
 
 WORKDIR /kubedoop/nifi
 
+ENTRYPOINT ["tini", "--", "/kubedoop/bin/entrypoint.sh"]
 CMD ["nifi.sh", "run"]
