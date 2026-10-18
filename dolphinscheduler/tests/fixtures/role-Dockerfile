@@ -1,0 +1,8 @@
+ARG IMAGE
+FROM ${IMAGE}
+USER root
+COPY ["mock-java.sh", "/kubedoop/run/java path/bin/java"]
+COPY mock-java.sh /kubedoop/run/legacy-java/bin/java
+RUN chmod 0755 '/kubedoop/run/java path/bin/java' /kubedoop/run/legacy-java/bin/java
+ENV JAVA_HOME="/kubedoop/run/java path"
+USER kubedoop

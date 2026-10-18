@@ -1,0 +1,21 @@
+#!/bin/bash
+# Keep upstream role configuration/classpaths, but run the JVM in the foreground.
+set -euo pipefail
+if [[ "${1:-}" == --help ]]; then
+    echo 'Usage: run-dolphinscheduler {standalone-server|api-server|master-server|worker-server|alert-server} [APPLICATION_ARGS...]'
+    exit 0
+fi
+role="${1:-}"
+case "$role" in
+    standalone-server|api-server|master-server|worker-server|alert-server) ;;
+    *) echo 'run-dolphinscheduler: a supported server role is required' >&2; exit 1 ;;
+esac
+shift
+readonly distribution=/kubedoop/dolphinscheduler
+[[ -x "$distribution/$role/bin/start-foreground.sh" ]] || {
+    echo 'run-dolphinscheduler: native role launcher is missing' >&2; exit 1;
+}
+cd "$distribution/$role"
+# 3.2.2 uses a role-local HOME; 3.3.2 computes a distribution-wide HOME itself.
+# Do not export DOLPHINSCHEDULER_HOME here: that would break the older classpath.
+exec "$distribution/$role/bin/start-foreground.sh" "$@"
