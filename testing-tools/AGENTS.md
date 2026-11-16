@@ -21,6 +21,10 @@ See `versions.yaml` for current values. Structure:
 - Extends: python:3.13-slim-bookworm; copies JDK 11 from an Eclipse Temurin build stage.
 - Used by: CI/CD integration tests for the Kubedoop data stack
 
+## Kafka Python client
+- `kafka-python3` 3.0.0 bundles an older `six`; the Dockerfile replaces it with the pinned `six` version for Python 3.12+ compatibility.
+- Verify with `sh testing-tools/tests/test_kafka_python.sh <image> [platform]`.
+
 ## Key Files
 - `Dockerfile` — multi-tool testing image with Python, JDK, kubectl, Keycloak CLI, Kerberos client
 - `python/requirements.txt` — 14 Python test packages (pyhive, kafka-python, pydruid, requests-kerberos, etc.)

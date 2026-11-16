@@ -83,6 +83,23 @@ EOF
 ENV PATH=$PATH:/kubedoop/keycloak/bin:/kubedoop/.local/bin \
     PRODUCT_VERSION=${PRODUCT_VERSION}
 
+# kafka-python3 3.0.0 bundles six 1.11, which cannot import six.moves on
+# Python 3.12+. Keep its kafka3 API while using the installed six version.
+RUN <<EOF
+    set -e
+    python - <<'PY'
+from pathlib import Path
+import shutil
+import sysconfig
+
+import six
+
+vendored_six = Path(sysconfig.get_paths()["purelib"]) / "kafka3/vendor/six.py"
+shutil.copyfile(six.__file__, vendored_six)
+PY
+    python -c 'from kafka3 import KafkaConsumer, KafkaProducer'
+EOF
+
 USER kubedoop
 
 WORKDIR /kubedoop
