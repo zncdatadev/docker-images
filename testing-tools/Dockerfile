@@ -10,6 +10,7 @@ ARG KEYCLOAK_VERSION
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN <<EOF
+    set -e
     groupadd --gid 1000 --system kubedoop
     useradd \
         --system \
@@ -21,6 +22,9 @@ RUN <<EOF
 EOF
 
 RUN <<EOF
+    set -e
+    # Debian 11 is EOL; its security packages are available from the archive.
+    sed -i 's|deb.debian.org/debian-security|archive.debian.org/debian-security|g' /etc/apt/sources.list
     apt-get update
     apt-get install -y --no-install-recommends \
         build-essential \
@@ -51,6 +55,7 @@ RUN curl -sSfL https://github.com/keycloak/keycloak/releases/download/${KEYCLOAK
     ln -s /kubedoop/keycloak-${KEYCLOAK_VERSION} /kubedoop/keycloak
 
 RUN <<EOF
+    set -e
     pip install --no-cache-dir --upgrade pip
     pip install --no-cache-dir -r /kubedoop/requirements.txt
 
