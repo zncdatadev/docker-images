@@ -30,7 +30,7 @@ ubi9/ubi-minimal (Red Hat)
 
 Standalone (not based on kubedoop-base):
   ├── krb5 (Rocky Linux + systemd, Kerberos KDC test server)
-  └── testing-tools (Debian Python, integration test utilities)
+  └── testing-tools (Debian Python, Temurin 11 build stage, integration test utilities)
 ```
 
 Cross-dependencies:
@@ -72,7 +72,7 @@ Cross-dependencies:
 | go-devel | devel | kubedoop-base | `make go-devel-build` | 2 |
 | krb5 | tools | rockylinux:9 | `make krb5-build` | 2 |
 | tools | tools | kubedoop-base | `make tools-build` | 2 |
-| testing-tools | tools | python:3.12-slim-bullseye | `make testing-tools-build` | 2 |
+| testing-tools | tools | python:3.13-slim-bookworm | `make testing-tools-build` | 2 |
 | airflow | app | vector | `make airflow-build` | 1 |
 | superset | app | vector | `make superset-build` | 1 |
 | dolphinscheduler | app | java-base | `make dolphinscheduler-build` | 2 |
