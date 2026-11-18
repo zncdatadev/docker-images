@@ -7,8 +7,9 @@ Integration testing utility image. Debian-based Python image with tools for E2E 
 ## Build
 - Command: `make testing-tools-build`
 - Base image: python:3.13-slim-bookworm (standalone, NOT kubedoop-base)
-- Build approach: Copies the Temurin 11 JDK from `eclipse-temurin:11-jdk-jammy` and keeps Java 11 as the default. Installs Debian's Java 17 JRE for its CA truststore, shared with Java 11. Installs build tools and Python packages from `python/requirements.txt`, downloads Keycloak CLI, and creates the kubedoop user (uid/gid 1000 — different from kubedoop-base's 1001).
+- Build approach: Installs Debian OpenJDK 17 JDK, build tools and Python packages from `python/requirements.txt`, downloads Keycloak CLI, and creates the kubedoop user (uid/gid 1000 — different from kubedoop-base's 1001).
 - Python runtime verification: `sh testing-tools/tests/test_python_runtime.sh <image> [platform]`.
+- Java and Keycloak CLI verification: `sh testing-tools/tests/test_keycloak_java.sh <image> [platform]`.
 
 ## Version Schema
 See `versions.yaml` for current values. Structure:
@@ -18,7 +19,7 @@ See `versions.yaml` for current values. Structure:
 | keycloak_version | Keycloak CLI version |
 
 ## Dependencies
-- Extends: python:3.13-slim-bookworm; copies JDK 11 from an Eclipse Temurin build stage.
+- Extends: python:3.13-slim-bookworm.
 - Used by: CI/CD integration tests for the Kubedoop data stack
 
 ## Kafka Python client

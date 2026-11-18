@@ -30,7 +30,7 @@ ubi9/ubi-minimal (Red Hat)
 
 Standalone (not based on kubedoop-base):
   ├── krb5 (Rocky Linux + systemd, Kerberos KDC test server)
-  └── testing-tools (Debian Python, Temurin 11 build stage, integration test utilities)
+  └── testing-tools (Debian Python, OpenJDK 17, integration test utilities)
 ```
 
 Cross-dependencies:

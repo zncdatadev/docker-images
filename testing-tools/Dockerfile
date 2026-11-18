@@ -1,13 +1,10 @@
 # syntax=docker/dockerfile:1.17.1@sha256:38387523653efa0039f8e1c89bb74a30504e76ee9f565e25c9a09841f9427b05
 # check=error=true
 
-FROM eclipse-temurin:11-jdk-jammy AS java11
-
 FROM python:3.13-slim-bookworm
 
 ARG PRODUCT_VERSION
 ARG KEYCLOAK_VERSION
-ARG TARGETARCH
 
 # Disable interactive prompts
 ENV DEBIAN_FRONTEND=noninteractive
@@ -23,8 +20,6 @@ RUN <<EOF
         --home-dir /kubedoop \
         kubedoop
 EOF
-
-COPY --from=java11 /opt/java/openjdk /usr/lib/jvm/java-11-openjdk-${TARGETARCH}
 
 RUN <<EOF
     set -e
@@ -47,20 +42,8 @@ RUN <<EOF
         tar \
         zip \
         unzip \
-        openjdk-17-jre-headless
+        openjdk-17-jdk-headless
 
-    # Bookworm no longer packages OpenJDK 11. Keep Java 11 as the default,
-    # and use the Debian-managed truststore for both Java runtimes.
-    JAVA_11_HOME=/usr/lib/jvm/java-11-openjdk-${TARGETARCH}
-    for java_tool in "${JAVA_11_HOME}"/bin/*; do
-        [ -f "$java_tool" ] && [ -x "$java_tool" ] || continue
-        name=${java_tool##*/}
-        update-alternatives --install "/usr/bin/${name}" "$name" "$java_tool" 1100
-        update-alternatives --set "$name" "$java_tool"
-    done
-    update-alternatives --install /usr/bin/jexec jexec "${JAVA_11_HOME}/lib/jexec" 1100
-    update-alternatives --set jexec "${JAVA_11_HOME}/lib/jexec"
-    ln -sf /etc/ssl/certs/java/cacerts "${JAVA_11_HOME}/lib/security/cacerts"
     java -version
     javac -version
     apt-get clean
@@ -101,5 +84,8 @@ PY
 EOF
 
 USER kubedoop
+
+# Verify both Keycloak CLI entry points with the image's default Java runtime.
+RUN kcadm.sh help >/dev/null && kcreg.sh help >/dev/null
 
 WORKDIR /kubedoop
