@@ -8,7 +8,6 @@ Integration testing utility image. Debian-based Python image with tools for E2E 
 - Command: `make testing-tools-build`
 - Base image: python:3.13-slim-bookworm (standalone, NOT kubedoop-base)
 - Build approach: Installs Debian OpenJDK 17 JDK, build tools and Python packages from `python/requirements.txt`, downloads Keycloak CLI, and creates the kubedoop user (uid/gid 1000 — different from kubedoop-base's 1001).
-- Python runtime verification: `sh testing-tools/tests/test_python_runtime.sh <image> [platform]`.
 - Java and Keycloak CLI verification: `sh testing-tools/tests/test_keycloak_java.sh <image> [platform]`.
 
 ## Version Schema
