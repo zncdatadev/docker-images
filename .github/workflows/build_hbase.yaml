@@ -11,7 +11,7 @@ on:
     branches:
       - main
     tags:
-        - '\d+.\d+.\d+*'
+        - '[0-9]+.[0-9]+.[0-9]+*'
     paths:
       - hbase/**
       - kubedoop-base/**
@@ -102,6 +102,15 @@ jobs:
           sign: ${{ github.ref_type == 'tag' }}
           action_debug: 'false' # enable debug for the build-and-push action if needed
 
+
+      - name: Run HBase lifecycle tests
+        env:
+          IMAGE: ${{ env.REGISTRY }}/hbase:${{ matrix.version }}-kubedoop${{ env.KUBEDOOP_VERSION }}-${{ matrix.arch }}
+        run: |
+          bash hbase/tests/source-entrypoint-framework.sh
+          bash hbase/tests/image-entrypoint-framework.sh "$IMAGE"
+          bash hbase/tests/image-native-launchers.sh "$IMAGE"
+          bash hbase/tests/image-hbase-lifecycle.sh "$IMAGE"
 
   build-manifest:
     name: Create manifest for ${{ matrix.version }}

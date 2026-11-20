@@ -1,0 +1,7 @@
+ARG IMAGE
+FROM ${IMAGE}
+USER root
+COPY mock-java.sh /kubedoop/run/mock-jre/bin/java
+RUN chmod 0755 /kubedoop/run/mock-jre/bin/java
+ENV JAVA_HOME=/kubedoop/run/mock-jre HBASE_LOG_DIR=/kubedoop/run/logs HBASE_JDK11=include
+USER kubedoop

@@ -2,12 +2,14 @@
 <!-- Parent: ../AGENTS.md -->
 
 ## Overview
-Apache HBase NoSQL database. Largest Dockerfile in the repo (291 lines) with 4 build stages, including a separate hbase-operator-tools build from a specific git commit SHA.
+Apache HBase NoSQL database. Multi-stage source build including separate hbase-operator-tools from a specific git commit SHA.
 
 ## Build Details
 - Build command: `make hbase-build`
-- Build stages: (1) hbase-builder -- builds HBase from source with `-Dhadoop.profile=3.0`, (2) hbase-operator-tools-builder -- builds from specific git commit SHA, (3) hadoop -- copies from hadoop image, (4) hadoop-s3-builder -- extracts AWS JARs
+- Build stages: (1) hbase-builder -- source with `-Dhadoop.profile=3.0`, (2) hbase-operator-tools-builder -- specific git commit SHA, (3) hadoop -- named source-built dependency, (4) hadoop-s3-builder -- AWS JARs, (5) tini-downloader -- checksum-pinned init, (6) final Java runtime
 - Build system: Maven
+- Product/operator-tools source downloads use bounded curl retries, gzip integrity validation and fail-fast pipelines, so truncated archives cannot continue into Maven.
+- Runtime adds an independent checksum-pinned Tini downloader stage and product-local universal lifecycle. Source builders and native launchers remain unchanged.
 - Base images: java-devel -> java-base
 
 ## Version Schema
@@ -26,6 +28,7 @@ See `versions.yaml` for current values. Structure:
 | jmx-exporter | JMX exporter version |
 | async-profiler | Async-profiler version |
 | oauth2-proxy | OAuth2 proxy version |
+| tini | Init version, with architecture-specific checksums |
 
 ## Kubedoop Customizations
 ### Patches (13 total across 3 components)
@@ -43,6 +46,9 @@ Note: JMX is conditional -- empty JMX_EXPORTER_VERSION for 2.6 which has native 
 
 ### Custom Scripts
 - `kubedoop/patches/apply_patches.sh` -- applies versioned patches during build
+- `kubedoop/bin/entrypoint.sh`, `kubedoop/lib/{log,run,signal}.sh` -- root-owned hooks, retained stdin, stderr framework diagnostics, bounded TERM/INT shutdown and exit propagation.
+- ENTRYPOINT is Tini plus the universal entrypoint; existing CMD `hbase master start` and UID 1001 are preserved. Native foreground paths already exec Java unless HBASE_NOEXEC is set; do not set it for a managed container main process.
+- `tests/` -- source/image generic regressions, six native role paths, real standalone default-CMD data/identity persistence and restart/TERM/INT. Fixtures never enter production.
 
 ## Extras
 - Downloads hbase-operator-tools from specific git commit SHA (not release tag)
@@ -57,7 +63,7 @@ Note: JMX is conditional -- empty JMX_EXPORTER_VERSION for 2.6 which has native 
 - Used by: spark-k8s (commented out, planned)
 
 ## Key Files
-- `Dockerfile` -- 291 lines, 4 stages (hbase-builder, operator-tools-builder, hadoop, hadoop-s3-builder)
+- `Dockerfile` -- product/tools source builders, Hadoop AWS dependency, Tini downloader and final runtime
 - `kubedoop/patches/hbase/{ver}/` -- per-version HBase patches
 - `kubedoop/patches/hbase-operator-tools/{ver}/` -- per-version operator-tools patches
 - `kubedoop/jmx/config/` -- 4 JMX configs (master, regionserver, restserver, base)
