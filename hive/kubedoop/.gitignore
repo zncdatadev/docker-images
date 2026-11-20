@@ -1,0 +1,2 @@
+# Framework libraries are product sources, not build output.
+!/lib/
