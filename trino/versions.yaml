@@ -1,15 +1,18 @@
 versions:
   - product: 451
+    tini: 0.19.0
     java-base: 22
     java-devel: 22
     jmx-exporter: 1.3.0
     storage-connector: 451
   - product: 470
+    tini: 0.19.0
     java-base: 23
     java-devel: 23
     jmx-exporter: 1.3.0
     storage-connector: 470
   - product: 476
+    tini: 0.19.0
     java-base: 24
     java-devel: 24
     jmx-exporter: 1.3.0
