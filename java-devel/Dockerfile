@@ -2,6 +2,20 @@
 # check=error=true
 
 
+FROM zncdatadev/image/kubedoop-base AS tini-downloader
+ARG TARGETARCH
+RUN <<EOF
+    set -e
+    curl -sSfL -o /tmp/tini "https://github.com/krallin/tini/releases/download/v0.19.0/tini-static-${TARGETARCH}"
+    case "${TARGETARCH}" in
+        amd64) expected_sha="c5b0666b4cb676901f90dfcb37106783c5fe2077b04590973b885950611b30ee" ;;
+        arm64) expected_sha="eae1d3aa50c48fb23b8cbdf4e369d0910dfc538566bfd09df89a774aa84a48b9" ;;
+        *) echo "Unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;;
+    esac
+    echo "${expected_sha}  /tmp/tini" | sha256sum -c
+    chmod 0755 /tmp/tini
+EOF
+
 FROM zncdatadev/image/kubedoop-base
 
 ARG PRODUCT_VERSION
@@ -41,6 +55,7 @@ EOF
         temurin-${PRODUCT_VERSION}-jdk \
         tzdata-java \
         unzip \
+        util-linux-core \
         wget \
         which \
         xz \
@@ -50,29 +65,20 @@ EOF
     microdnf clean all
     rm -rf /var/cache/yum
 
-    # Due to the maven default dependency jdk17, so two versions of jdk are installed if the PRODUCT_VERSION is not 17.
-    # Use alternatives to set the default Java version
-
-    # Determine Java path based on version
-    if [ "${PRODUCT_VERSION}" -ge "24" ]; then
-        EXPECTED_JAVA_PATH="/usr/lib/jvm/java-${PRODUCT_VERSION}-temurin-jdk"
-    else
-        EXPECTED_JAVA_PATH="/usr/lib/jvm/temurin-${PRODUCT_VERSION}-jdk"
+    # Preserve the public JAVA_HOME even when Temurin changes its package path.
+    public_home="/usr/lib/jvm/temurin-${PRODUCT_VERSION}-jdk"
+    if [ ! -d "$public_home" ]; then
+        test -x "/usr/lib/jvm/java-${PRODUCT_VERSION}-temurin-jdk/bin/javac"
+        ln -s "java-${PRODUCT_VERSION}-temurin-jdk" "$public_home"
     fi
-
-    # Check current java version and reset alternatives if needed
-    CURRENT_JAVA_VERSION=$(alternatives --display java | grep "link currently points to" | grep -oE "/usr/lib/jvm/(temurin|java)-[0-9]+-.*jdk")
-
-    if [ "$CURRENT_JAVA_VERSION" != "$EXPECTED_JAVA_PATH" ]; then
-        echo "Configuring Java alternatives for version ${PRODUCT_VERSION} at path ${EXPECTED_JAVA_PATH}"
-        # Install alternatives if not exists
-        alternatives --install /usr/bin/java java ${EXPECTED_JAVA_PATH}/bin/java 1
-        alternatives --install /usr/bin/javac javac ${EXPECTED_JAVA_PATH}/bin/javac 1
-
-        # Set alternatives
-        alternatives --set java ${EXPECTED_JAVA_PATH}/bin/java
-        alternatives --set javac ${EXPECTED_JAVA_PATH}/bin/javac
-    fi
+    jdk_home=$(readlink -f "$public_home")
+    # Maven brings JDK17 too. Select the vendor's existing canonical alternatives
+    # instead of re-registering a symlink path without jar/javadoc slave links.
+    alternatives --set java "$jdk_home/bin/java"
+    alternatives --set javac "$jdk_home/bin/javac"
+    for tool in java javac jar javadoc javap; do
+        test "$(readlink -f "$(command -v "$tool")")" = "$jdk_home/bin/$tool"
+    done
 
     # smoke test
     JAVA_VERSION_OUTPUT=$(java -version 2>&1)
@@ -98,3 +104,15 @@ ENV JAVA_VERSION=${PRODUCT_VERSION}
 # This variable is supported as of Log4j version 2.10 and
 # disables the vulnerable feature
 ENV LOG4J_FORMAT_MSG_NO_LOOKUPS=true
+
+COPY --from=tini-downloader /tmp/tini /usr/bin/tini
+COPY --chown=root:root kubedoop/ /usr/local/libexec/kubedoop-java-devel/
+RUN chmod -R 0755 /usr/local/libexec/kubedoop-java-devel \
+    && chown root:kubedoop /kubedoop && chmod 1770 /kubedoop \
+    && mkdir -p /kubedoop/mount/pre-script /kubedoop/mount/post-script /kubedoop/run \
+    && chown -R root:root /kubedoop/mount && chmod -R 0755 /kubedoop/mount \
+    && chown kubedoop:kubedoop /kubedoop/run && chmod 1775 /kubedoop/run
+
+# Preserve the SDK's inherited root USER, working directory and default Bash.
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/libexec/kubedoop-java-devel/bin/entrypoint.sh"]
+CMD ["/bin/bash"]
