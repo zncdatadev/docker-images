@@ -11,9 +11,9 @@ RUN --mount=type=cache,target=/root/.m2 <<EOF
     set -ex
     mkdir -p /build/trino-storage-src
     pushd /build/trino-storage-src
-    # https://github.com/snowlift/trino-storage/archive/refs/tags/v454.tar.gz
+    # Stackable's mirror of the snowlift/trino-storage project.
     curl -sSfL \
-        https://github.com/snowlift/trino-storage/archive/refs/tags/v${STORAGE_CONNECTOR_VERSION}.tar.gz \
+        https://github.com/stackabletech/trino-storage/archive/refs/tags/v${STORAGE_CONNECTOR_VERSION}.tar.gz \
         | tar xzf - --strip-components=1
 
     ./mvnw --no-transfer-progress versions:set -DnewVersion=${STORAGE_CONNECTOR_VERSION}
