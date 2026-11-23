@@ -1,33 +1,10 @@
 # syntax=docker/dockerfile:1.17.1@sha256:38387523653efa0039f8e1c89bb74a30504e76ee9f565e25c9a09841f9427b05
 # check=error=true
 
-## stage: trino-storage-connector-builder
-FROM zncdatadev/image/java-devel AS storage-connector-builder
-
-ARG PRODUCT_VERSION
-ARG STORAGE_CONNECTOR_VERSION
-
-RUN --mount=type=cache,target=/root/.m2 <<EOF
-    set -ex
-    mkdir -p /build/trino-storage-src
-    pushd /build/trino-storage-src
-    # https://github.com/snowlift/trino-storage/archive/refs/tags/v454.tar.gz
-    curl -sSfL \
-        https://github.com/snowlift/trino-storage/archive/refs/tags/v${STORAGE_CONNECTOR_VERSION}.tar.gz \
-        | tar xzf - --strip-components=1
-
-    ./mvnw --no-transfer-progress versions:set -DnewVersion=${STORAGE_CONNECTOR_VERSION}
-    ./mvnw --no-transfer-progress package -DskipTests -Dmaven.gitcommitid.skip=true
-
-    # all jars artifact location: /build/trino-storage-src/target/trino-storage-451/
-EOF
-
-
 ## stage: trino-builder
 FROM zncdatadev/image/java-devel AS trino-builder
 
 ARG PRODUCT_VERSION
-ARG STORAGE_CONNECTOR_VERSION
 ARG JMX_EXPORTER_VERSION
 
 WORKDIR /build
@@ -107,6 +84,18 @@ RUN --mount=type=cache,target=/root/.m2 <<EOF
     echo "Trino CLI smoke test passed"
 EOF
 
+# Verify that the server package contains the built-in data lake connectors.
+RUN <<EOF
+    set -e
+    for connector in hive iceberg; do
+        plugin_dir="/kubedoop/trino-server/plugin/${connector}"
+        if [ ! -d "${plugin_dir}" ] || ! find "${plugin_dir}" -maxdepth 1 -type f -name "trino-${connector}-*.jar" -print -quit | grep -q .; then
+            echo "ERROR: Built-in ${connector} connector not found in ${plugin_dir}"
+            exit 1
+        fi
+    done
+EOF
+
 # smoke test - enhanced with status check and error handling
 RUN <<EOF
     microdnf update
@@ -137,7 +126,6 @@ RUN <<EOF
     fi
 EOF
 
-COPY --from=storage-connector-builder --chown=kubedoop:kubedoop /build/trino-storage-src/target/trino-storage-${STORAGE_CONNECTOR_VERSION} /kubedoop/trino-server/plugin/trino-storage-${STORAGE_CONNECTOR_VERSION}
 
 # Fix log4j vulnerability
 RUN <<EOF
