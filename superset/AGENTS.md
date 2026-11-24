@@ -26,7 +26,11 @@ See `versions.yaml` for current values. Structure:
 ### JMX Configuration
 - NONE (Python product, not JVM-based)
 ### Custom Scripts
-- `kubedoop/bin/entrypoint.sh` — runs gunicorn with configurable env vars: SUPERSET_BIND_ADDRESS, SUPERSET_PORT, SERVER_WORKER_AMOUNT, SERVER_WORKER_CLASS, SERVER_THREADS_AMOUNT, GUNICORN_TIMEOUT, GUNICORN_KEEPALIVE, WORKER_MAX_REQUESTS, WORKER_MAX_REQUESTS_JITTER, SERVER_LIMIT_REQUEST_LINE, SERVER_LIMIT_REQUEST_FIELD_SIZE
+- `kubedoop/bin/entrypoint.sh`, `kubedoop/lib/` — universal lifecycle with checksum-pinned Tini 0.19.0 and util-linux setsid, protected helpers and sticky writable HOME/run, stdin/status retention, exactly-once pre/post hooks and bounded shutdown.
+- `kubedoop/bin/run-superset` — exec Gunicorn webserver with the original environment defaults and quoted/forwarded args; native Celery worker/beat roles and arbitrary command pass-through, no xtrace/argument logging.
+- Gunicorn/Celery masters own graceful worker shutdown first, then drain remaining group members before hooks. No automatic schema/user/key initialization.
+- ENTRYPOINT prefixes run-superset; CMD is `webserver`; UID1001 and venv/config paths preserved.
+- `tests/` — source/adapter contracts and full image/native service regressions.
 
 ## Dependencies
 - Uses at build time: vector (builder stage)
