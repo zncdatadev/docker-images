@@ -11,7 +11,7 @@ on:
     branches:
       - main
     tags:
-        - '\d+.\d+.\d+*'
+        - '[0-9]+.[0-9]+.[0-9]+*'
     paths:
       - hadoop/**
       - kubedoop-base/**
@@ -103,6 +103,15 @@ jobs:
           sign: ${{ github.ref_type == 'tag' }}
           action_debug: 'false' # enable debug for the build-and-push action if needed
 
+
+      - name: Run Hadoop lifecycle tests
+        env:
+          IMAGE: ${{ env.REGISTRY }}/hadoop:${{ matrix.version }}-kubedoop${{ env.KUBEDOOP_VERSION }}-${{ matrix.arch }}
+        run: |
+          bash hadoop/tests/source-entrypoint-framework.sh
+          bash hadoop/tests/image-entrypoint-framework.sh "$IMAGE"
+          bash hadoop/tests/image-native-launchers.sh "$IMAGE"
+          bash hadoop/tests/image-hadoop-lifecycle.sh "$IMAGE"
 
   build-manifest:
     name: Create manifest for ${{ matrix.version }}
