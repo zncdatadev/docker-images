@@ -1,0 +1,9 @@
+ARG IMAGE
+FROM ${IMAGE}
+COPY legacy-entrypoint.sh /kubedoop/bin/entrypoint.sh
+COPY 10-pre.sh /kubedoop/mount/pre-script/10-pre.sh
+COPY 10-post.sh /kubedoop/mount/post-script/10-post.sh
+RUN chmod 0755 /kubedoop/bin/entrypoint.sh /kubedoop/mount/pre-script/10-pre.sh /kubedoop/mount/post-script/10-post.sh \
+    && chown -R kubedoop:kubedoop /kubedoop/bin
+USER kubedoop
+CMD ["/kubedoop/bin/entrypoint.sh"]
