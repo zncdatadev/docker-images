@@ -1,0 +1,15 @@
+[Unit]
+Description=Kubedoop Kerberos shutdown hooks
+Before=krb5kdc.service kadmin.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+ExecStop=/usr/local/libexec/kubedoop-krb5/bin/post.sh
+TimeoutStopSec=30
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=container-krb5.target
