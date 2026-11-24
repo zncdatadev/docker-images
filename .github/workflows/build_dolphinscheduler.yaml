@@ -11,7 +11,7 @@ on:
     branches:
       - main
     tags:
-        - '\d+.\d+.\d+*'
+        - '[0-9]+.[0-9]+.[0-9]+*'
     paths:
       - dolphinscheduler/**
       - kubedoop-base/**
@@ -60,6 +60,7 @@ jobs:
     needs:
       - product-shard
     strategy:
+      fail-fast: false
       matrix:
         version: ${{fromJson(needs.product-shard.outputs.versions)}}
         arch: [amd64, arm64]
@@ -103,6 +104,24 @@ jobs:
           sign: ${{ github.ref_type == 'tag' }}
           action_debug: 'false' # enable debug for the build-and-push action if needed
 
+
+      - name: Run DolphinScheduler lifecycle tests
+        env:
+          IMAGE: ${{ env.REGISTRY }}/dolphinscheduler:${{ matrix.version }}-kubedoop${{ env.KUBEDOOP_VERSION }}-${{ matrix.arch }}
+        run: |
+          bash dolphinscheduler/tests/source-entrypoint-framework.sh
+          sudo bash dolphinscheduler/tests/source-entrypoint-framework.sh
+          bash dolphinscheduler/tests/source-launcher-adaptation.sh
+          sudo bash dolphinscheduler/tests/source-launcher-adaptation.sh
+          bash dolphinscheduler/tests/image-entrypoint-framework.sh "$IMAGE"
+          bash dolphinscheduler/tests/image-role-launchers.sh "$IMAGE"
+          bash dolphinscheduler/tests/image-dolphinscheduler-lifecycle.sh "$IMAGE"
+          for identity in kubedoop root; do
+            docker run --rm --pull=never --user "$identity" --entrypoint bash \
+              -v "$PWD:/src:ro" "$IMAGE" /src/dolphinscheduler/tests/source-entrypoint-framework.sh
+            docker run --rm --pull=never --user "$identity" --entrypoint bash \
+              -v "$PWD:/src:ro" "$IMAGE" /src/dolphinscheduler/tests/source-launcher-adaptation.sh
+          done
 
   build-manifest:
     name: Create manifest for ${{ matrix.version }}
