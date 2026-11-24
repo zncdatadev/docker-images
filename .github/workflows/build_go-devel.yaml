@@ -11,7 +11,7 @@ on:
     branches:
       - main
     tags:
-        - '\d+.\d+.\d+*'
+        - '[0-9]+.[0-9]+.[0-9]+*'
     paths:
       - go-devel/**
       - kubedoop-base/**
@@ -95,6 +95,36 @@ jobs:
           push: ${{ github.event_name == 'push' }}
           sign: ${{ github.ref_type == 'tag' }}
           action_debug: 'false' # enable debug for the build-and-push action if needed
+
+      - name: Run Go SDK Lifecycle
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="${REGISTRY}/${PRODUCT_NAME}:${{ matrix.version }}-kubedoop${KUBEDOOP_VERSION}-${{ matrix.arch }}"
+          bash go-devel/tests/source-entrypoint-framework.sh
+          bash go-devel/tests/image-entrypoint-framework.sh "$image"
+          bash go-devel/tests/image-go-lifecycle.sh "$image" '${{ matrix.version }}'
+
+      - name: Build downstream Airflow smoke image
+        if: ${{ matrix.version == '1.23.12' }}
+        uses: ./.github/actions/build-and-push
+        with:
+          registry: ${{ env.REGISTRY }}
+          kubedoop_version: ${{ env.KUBEDOOP_VERSION }}
+          product_name: airflow
+          product_version: '3.0.1'
+          platform: ${{ matrix.platform }}
+          arch_suffix: true
+          push: 'false'
+          sign: 'false'
+
+      - name: Verify downstream builder artifacts
+        if: ${{ matrix.version == '1.23.12' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="${REGISTRY}/airflow:3.0.1-kubedoop${KUBEDOOP_VERSION}-${{ matrix.arch }}"
+          bash go-devel/tests/image-downstream-airflow.sh "$image"
 
 
   build-manifest:
