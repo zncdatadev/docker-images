@@ -12,7 +12,7 @@ on:
     branches:
       - main
     tags:
-        - '\d+.\d+.\d+*'
+        - '[0-9]+.[0-9]+.[0-9]+*'
     paths:
       - helloworld/**
       - kubedoop-base/**
@@ -100,6 +100,14 @@ jobs:
           push: ${{ github.event_name == 'push' }}
           sign: ${{ github.ref_type == 'tag' }}
           action_debug: 'false' # enable debug for the build-and-push action if needed
+
+      - name: Run Helloworld Lifecycle
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="${REGISTRY}/${PRODUCT_NAME}:${{ matrix.version }}-kubedoop${KUBEDOOP_VERSION}-${{ matrix.arch }}"
+          bash helloworld/tests/source-entrypoint-framework.sh
+          bash helloworld/tests/image-entrypoint-framework.sh "$image"
 
 
   build-manifest:
