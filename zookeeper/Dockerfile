@@ -73,7 +73,33 @@ RUN <<EOF
     curl -sSfL -o /usr/local/bin/log4shell \
         https://github.com/lunasec-io/lunasec/releases/download/v1.6.1-log4shell/log4shell_1.6.1-log4shell_Linux_${ARCH}
     chmod +x /usr/local/bin/log4shell
-    /usr/local/bin/log4shell patch --backup --force-patch --json hadoop-${PRODUCT_VERSION}
+    /usr/local/bin/log4shell patch --backup --force-patch --json /kubedoop/zookeeper
+EOF
+
+
+# stage: tini-downloader
+# tini: lightweight init, signal forwarding to direct child, zombie reaping
+# Not available in UBI 9 repos — download static binary from GitHub releases.
+# Download and verification live in this build stage so the result image only
+# receives the verified binary and never runs download tooling.
+FROM zncdatadev/image/java-devel AS tini-downloader
+
+ARG TARGETARCH
+ARG TINI_VERSION
+
+RUN <<EOF
+    set -e
+    curl -sSfL -o /tmp/tini \
+        "https://github.com/krallin/tini/releases/download/v${TINI_VERSION}/tini-static-${TARGETARCH}"
+
+    # SHA256 checksums are hardcoded in the verification step to prevent --build-arg override
+    case "${TARGETARCH}" in
+        arm64)  expected_sha="eae1d3aa50c48fb23b8cbdf4e369d0910dfc538566bfd09df89a774aa84a48b9" ;;
+        amd64)  expected_sha="c5b0666b4cb676901f90dfcb37106783c5fe2077b04590973b885950611b30ee" ;;
+        *)      echo "Unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;;
+    esac
+    echo "${expected_sha}  /tmp/tini" | sha256sum -c
+    chmod +x /tmp/tini
 EOF
 
 
@@ -86,10 +112,35 @@ WORKDIR /kubedoop
 
 COPY --from=zookeeper-builder --chown=kubedoop:kubedoop /kubedoop/ /kubedoop/
 
+# setsid keeps application descendants out of the entrypoint/post-hook group.
+RUN microdnf install -y util-linux-core && microdnf clean all
+
+# Init system, downloaded and checksum-verified in the tini-downloader stage
+COPY --from=tini-downloader /tmp/tini /usr/bin/tini
+
+# Deploy universal entrypoint framework
+# Framework files: root-owned, world-readable/executable, NOT writable by kubedoop
+COPY --chown=root:root kubedoop/lib/ /kubedoop/lib/
+COPY --chown=root:root kubedoop/bin/entrypoint.sh /kubedoop/bin/entrypoint.sh
+RUN chown root:kubedoop /kubedoop \
+    && chmod 1770 /kubedoop \
+    && chown -R root:root /kubedoop/lib/ /kubedoop/bin/ \
+    && chmod -R 0755 /kubedoop/lib/ /kubedoop/bin/ \
+    && mkdir -p /kubedoop/mount/pre-script /kubedoop/mount/post-script \
+    && chown -R root:root /kubedoop/mount/ \
+    && mkdir -p /kubedoop/run \
+    && chown kubedoop:kubedoop /kubedoop/run \
+    && chmod 1775 /kubedoop/run
+
 ENV ZOOKEEPER_HOME=/kubedoop/zookeeper
 ENV PATH="$ZOOKEEPER_HOME/bin:$PATH"
 
 WORKDIR /kubedoop/zookeeper
+
 USER kubedoop
 
-CMD ["bin/zkServer.sh", "start-foreground", "config/zoo_sample.cfg"]
+# Init process as PID 1
+# No -g flag: tini forwards signals only to direct child process.
+# The entrypoint.sh manages signal propagation explicitly via trap.
+ENTRYPOINT ["tini", "--", "/kubedoop/bin/entrypoint.sh"]
+CMD ["bin/zkServer.sh", "start-foreground", "conf/zoo_sample.cfg"]
