@@ -1,75 +1,103 @@
 #!/usr/bin/env bash
+# Validate/initialize a caller-selected database, then hand off to the native JVM.
+set -uo pipefail
 
 CONF_DIR=""
 DB_TYPE=""
 HIVE_BIN_DIR=""
+METASTORE_ARGS=()
+SCHEMA_PID=""
+STOP_TIMER_PID=""
+SHUTDOWN_REQUESTED=0
 
-function parse_args {
-  while true; do
-    echo "processing arg $1"
-    case $1 in
-      --db-type)
-        shift
-        DB_TYPE=$1
-        shift
-      ;;
-      --config)
-        shift
-        CONF_DIR=$1
-        shift
-      ;;
-      --hive-bin-dir)
-        shift
-        HIVE_BIN_DIR=$1
-        shift
-      ;;
-      --help)
-        echo  "Checks if the metastore DB contains the needed schema and initializes it "
-        echo   "if it does not exist.  Starts the metastore."
-        echo  ""
-        echo  "Usage: start-metastore <options>"
-        echo  "Options:"
-        echo  "  --help"
-        echo  "  --db-type <derby|mssql|mysql|postgres|oracle>"
-        echo  "  --config <path-to-hive-config-directory>"
-        echo  "  --hive-bin-dir <path-to-hive-bin-directory>"
-        exit
-      ;;
-      *)
-        break
-      ;;
+usage() {
+  echo "Checks the metastore schema, initializes it if validation fails, and starts the metastore."
+  echo "Usage: start-metastore --db-type TYPE --config DIR --hive-bin-dir DIR [-- METASTORE_ARGS...]"
+  echo "TYPE: derby|mssql|mysql|postgres|oracle"
+}
+
+fail() { echo "start-metastore: $*" >&2; exit 1; }
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --help) usage; exit 0 ;;
+      --db-type|--config|--hive-bin-dir)
+        [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || fail "missing value for $1"
+        case "$1" in
+          --db-type) DB_TYPE="$2" ;;
+          --config) CONF_DIR="$2" ;;
+          --hive-bin-dir) HIVE_BIN_DIR="$2" ;;
+        esac
+        shift 2 ;;
+      --) shift; METASTORE_ARGS=("$@"); break ;;
+      *) fail "unknown option (use -- before metastore arguments)" ;;
     esac
   done
+  [[ -d "$CONF_DIR" ]] || fail "missing configuration directory"
+  [[ -d "$HIVE_BIN_DIR" && -x "$HIVE_BIN_DIR/base" ]] || fail "missing executable hive bin directory"
+  case "$DB_TYPE" in
+    derby|mssql|mysql|postgres|oracle) ;;
+    *) fail "unsupported or missing database type" ;;
+  esac
+}
 
-  if [ ! -d "$CONF_DIR" ]; then
-    echo "Missing configuration directory."
-    exit 1
-  fi
-  if [ ! -d "$HIVE_BIN_DIR" ]; then
-    echo "Missing hive bin directory."
-    exit 1
-  fi
-  if [ -z "$DB_TYPE" ]; then
-    echo "Missing database type."
-    exit 1
+shutdown_schema() {
+  SHUTDOWN_REQUESTED=1
+  [[ -n "$SCHEMA_PID" ]] || return 0
+  kill -TERM "$SCHEMA_PID" 2>/dev/null || true
+  if [[ -z "$STOP_TIMER_PID" ]]; then
+    # Stop the owned schema JVM before the outer lifecycle's timeout can expire.
+    local budget="${KUBEDOOP_KILL_TIMEOUT:-30}"
+    [[ "$budget" =~ ^[1-9][0-9]*$ ]] || budget=30
+    local grace=$((budget / 2))
+    # With a one-second outer budget, escalate immediately rather than racing
+    # the outer KILL and leaving a schema JVM alive during post-hooks.
+    ( sleep "$grace"; kill -KILL "$SCHEMA_PID" 2>/dev/null || true ) &
+    STOP_TIMER_PID=$!
   fi
 }
 
-function init_schema {
-  if ! "$HIVE_BIN_DIR/base" --config "$CONF_DIR" --service schemaTool -dbType "$DB_TYPE" -validate ; then
-    echo "No valid schema found, initializing schema ..."
-    "$HIVE_BIN_DIR/base" --config "$CONF_DIR" --service schemaTool -dbType "$DB_TYPE" -initSchema || exit 1
+run_schema_tool() {
+  local rc=0
+  "$HIVE_BIN_DIR/base" --config "$CONF_DIR" --service schemaTool -dbType "$DB_TYPE" "$@" <&0 & SCHEMA_PID=$!
+  [[ "$SHUTDOWN_REQUESTED" -eq 0 ]] || shutdown_schema
+  while :; do
+    wait "$SCHEMA_PID" 2>/dev/null
+    rc=$?
+    if [[ "$SHUTDOWN_REQUESTED" -eq 1 && ( "$rc" -eq 130 || "$rc" -eq 143 ) ]] &&
+       kill -0 "$SCHEMA_PID" 2>/dev/null; then
+      continue
+    fi
+    break
+  done
+  if [[ -n "$STOP_TIMER_PID" ]]; then
+    # This owned timer must be cancelled even if its shell ignores TERM.
+    # Reap it before clearing the schema PID or leaving the cancellation path.
+    kill -KILL "$STOP_TIMER_PID" 2>/dev/null || true
+    while :; do
+      local timer_rc=0
+      wait "$STOP_TIMER_PID" 2>/dev/null || timer_rc=$?
+      if [[ "$SHUTDOWN_REQUESTED" -eq 1 && ( "$timer_rc" -eq 130 || "$timer_rc" -eq 143 ) ]] &&
+         kill -0 "$STOP_TIMER_PID" 2>/dev/null; then
+        continue
+      fi
+      break
+    done
+    STOP_TIMER_PID=""
   fi
+  SCHEMA_PID=""
+  [[ "$SHUTDOWN_REQUESTED" -eq 0 ]] || exit 143
+  return "$rc"
 }
 
-function start_metastore {
-  "$HIVE_BIN_DIR/base" --config "$CONF_DIR" --service metastore
-}
-
-function main {
-  parse_args "$@"
-  init_schema
-  start_metastore
-}
-
-main "$@"
+trap shutdown_schema TERM INT
+parse_args "$@"
+if ! run_schema_tool -validate; then
+  echo "No valid schema found, initializing schema ..." >&2
+  run_schema_tool -initSchema || exit 1
+fi
+[[ "$SHUTDOWN_REQUESTED" -eq 0 ]] || exit 143
+# Reset handlers before exec; the JVM receives shutdown signals directly.
+trap - TERM INT
+exec "$HIVE_BIN_DIR/base" --config "$CONF_DIR" --service metastore "${METASTORE_ARGS[@]}"

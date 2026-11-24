@@ -6,9 +6,10 @@ Apache Hive metastore. Only builds the metastore component, NOT the full Hive se
 
 ## Build Details
 - Build command: `make hive-build`
-- Build stages: single build stage that branches by version -- for versions < 4.0.0 builds standalone-metastore directly; for >= 4.0.0 follows HIVE-20451 two-stage approach with separate metastore-server
+- Build stages: hive-builder branches by version (< 4.0.0 standalone-metastore; >= 4.0.0 HIVE-20451 two-stage metastore-server), checksum-verified tini-downloader, Hadoop distribution import, final runtime
 - Build system: Maven
 - Base images: java-devel -> java-base
+- Hive 4.0.0 runtime assembly corrects the native schemaTool launcher's stale class name to match its packaged tools.schematool.MetastoreSchemaTool and the upstream 4.0.1 script; a typed help smoke test checks class loading without initializing any database.
 
 ## Version Schema
 See `versions.yaml` for current values. Structure:
@@ -20,6 +21,7 @@ See `versions.yaml` for current values. Structure:
 | java-devel | JDK version for build (Java 8 -- unique split from runtime) |
 | hadoop | Hadoop version (provides HDFS client + AWS/Azure JARs) |
 | jmx-exporter | JMX exporter version |
+| tini | Pinned init binary version (architecture-specific checksums in Dockerfile) |
 
 ## Kubedoop Customizations
 ### Patches (12 total)
@@ -30,7 +32,11 @@ See `versions.yaml` for current values. Structure:
 - `config.yaml` -- minimal JMX configuration
 
 ### Custom Scripts
-- `bin/start-metastore` -- custom startup script with `--db-type`, `--config`, `--hive-bin-dir` arguments. Handles database schema initialization before starting the metastore service.
+- `bin/start-metastore` -- explicit validate/initialize helper with `--db-type`, `--config`, `--hive-bin-dir` and service arguments after `--`; stops schema children on cancellation and execs the native metastore launcher.
+- `bin/entrypoint.sh`, `lib/{log,run,signal}.sh` -- universal foreground lifecycle, projected root-owned hooks, bounded graceful termination and application status propagation.
+- Default ENTRYPOINT is tini plus the universal entrypoint; default CMD is `base --service metastore`. No database type or schema initialization policy is imposed by the default CMD.
+- `tests/` -- source/helper/image regressions and real Thrift/Derby persistence/TERM/INT tests for default CMD and the schema helper; fixtures never enter production.
+- Owned managed process groups drain before post-hooks even after normal main exit. Lifecycle ALRM and schema-helper timers are forcibly cancelled and reaped; tests retain true statuses 127/142/165 and cover root/UID1001 native and wrapper launches with three same-container starts, TERM/INT/stop and exact PRE/POST ordering.
 
 ## Extras
 - Uses Java 8 for devel but Java 11 for base (unique split across the repo)
