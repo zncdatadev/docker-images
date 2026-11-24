@@ -138,6 +138,21 @@ RUN <<EOF
 EOF
 
 
+# stage: tini-downloader
+FROM zncdatadev/image/vector AS tini-downloader
+ARG TARGETARCH
+RUN <<EOF
+    set -e
+    curl -sSfL -o /tmp/tini "https://github.com/krallin/tini/releases/download/v0.19.0/tini-static-${TARGETARCH}"
+    case "${TARGETARCH}" in
+        amd64) expected_sha="c5b0666b4cb676901f90dfcb37106783c5fe2077b04590973b885950611b30ee" ;;
+        arm64) expected_sha="eae1d3aa50c48fb23b8cbdf4e369d0910dfc538566bfd09df89a774aa84a48b9" ;;
+        *) echo "Unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;;
+    esac
+    echo "${expected_sha}  /tmp/tini" | sha256sum -c
+    chmod 0755 /tmp/tini
+EOF
+
 # stage: final
 FROM zncdatadev/image/vector
 
@@ -148,6 +163,7 @@ RUN <<EOF
     microdnf update
     microdnf install \
         cyrus-sasl \
+        libstdc++ \
         libpq \
         make \
         openldap \
@@ -160,16 +176,26 @@ RUN <<EOF
         python${PYTHON_VERSION}-pip \
         socat \
         unixODBC
+    microdnf install util-linux-core
 
     microdnf clean all
     rm -rf /var/cache/yum
 EOF
 
-COPY kubedoop/bin/entrypoint.sh /kubedoop/bin/entrypoint.sh
-
 COPY --from=airflow-builder --chown=kubedoop:kubedoop /kubedoop /kubedoop
 COPY --from=statsd-exporter-builder --chown=kubedoop:kubedoop /kubedoop/bin/statsd-exporter /kubedoop/bin/statsd-exporter
 COPY --from=git-sync-builder --chown=kubedoop:kubedoop /kubedoop/bin/git-sync /kubedoop/bin/git-sync
+
+COPY --from=tini-downloader /tmp/tini /usr/bin/tini
+COPY --chown=root:root kubedoop/bin/ /kubedoop/bin/
+COPY --chown=root:root kubedoop/lib/ /kubedoop/lib/
+RUN chown root:kubedoop /kubedoop \
+    && chmod 1770 /kubedoop \
+    && chown root:root /kubedoop/bin /kubedoop/lib \
+    && chmod -R 0755 /kubedoop/bin /kubedoop/lib \
+    && mkdir -p /kubedoop/mount/pre-script /kubedoop/mount/post-script /kubedoop/run /kubedoop/airflow \
+    && chown -R root:root /kubedoop/mount && chmod -R 0755 /kubedoop/mount \
+    && chown kubedoop:kubedoop /kubedoop/run /kubedoop/airflow && chmod 1775 /kubedoop/run
 
 ENV VIRTUAL_ENV=/kubedoop/app
 ENV PATH="${VIRTUAL_ENV}/bin:${PATH}" \
@@ -179,4 +205,5 @@ WORKDIR /kubedoop
 
 USER kubedoop
 
-ENTRYPOINT [ "/kubedoop/bin/entrypoint.sh" ]
+ENTRYPOINT ["tini", "--", "/kubedoop/bin/entrypoint.sh", "/kubedoop/bin/run-airflow"]
+CMD ["airflow", "--help"]
